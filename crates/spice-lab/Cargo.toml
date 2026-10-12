@@ -1,0 +1,16 @@
+[package]
+name = "spice-lab"
+version = "0.1.0"
+description = "Schematic converter, ngspice comparison and benchmarks for robine-spice"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The library under test, checked out next to this repository.
+robine-spice = { path = "../../../robine-spice/crates/robine-spice" }
+wavelab = { path = "../wavelab" }
+clap = { version = "4.5", features = ["derive"] }
+roxmltree = "0.20"

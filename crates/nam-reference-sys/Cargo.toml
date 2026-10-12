@@ -1,0 +1,13 @@
+[package]
+name = "nam-reference-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "FFI bindings to the upstream NeuralAmpModelerCore C++ reference implementation (fetched at a pinned commit by vendor.sh)"
+links = "nam_reference"
+build = "build.rs"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.1"

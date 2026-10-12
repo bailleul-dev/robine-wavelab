@@ -1,0 +1,14 @@
+[package]
+name = "wavelab"
+version = "0.1.0"
+description = "Device-agnostic audio measurements: probe signals, null tests, perceptual difference measures"
+readme = "../../README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hound = "3.5"
+realfft = "3.5"
+serde = { version = "1.0", features = ["derive"] }

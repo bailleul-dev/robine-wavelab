@@ -1,0 +1,102 @@
+# AI Declaration — https://ai-declaration.org/
+# Machine-readable record of how AI tools were used in this project.
+# Validate with: make aidecl-check
+schema_version: "1.0.0"
+
+project:
+  name: robine-wavelab
+  repository: https://github.com/bailleul-dev/robine-wavelab
+  license: MIT
+  content_type: software
+
+ai_usage:
+  used: true
+  level: extensive
+  summary: >-
+    This project was built with intensive use of an AI coding agent. The
+    measurement library, the three command-line tools, the scripts and the
+    documentation were written by Claude Code (Anthropic) working
+    interactively under the direction of the maintainer, who set the goals
+    (one bench for robine-spice and robine-nam, objective measures of how
+    alike two renders sound that can drive iteration without listening)
+    and reviews the output. The tooling was first written inside
+    robine-spice and robine-nam and moved here.
+  tools:
+    - name: Claude Code
+      vendor: Anthropic
+      type: agent
+      hosting: cloud_vendor
+      model: claude-opus-5-5
+      purpose:
+        - code_generation
+        - testing
+        - debugging
+        - documentation
+        - benchmarking
+      period:
+        start: "2026-10-10"
+  activities:
+    - code_generation
+    - testing
+    - debugging
+    - refactoring
+    - documentation
+    - infrastructure
+  ai_proportion:
+    qualitative: mostly_ai
+    ai_generated_percent: 95
+    ai_assisted_percent: 0
+    human_only_percent: 5
+    method: self_reported
+  code_proportion:
+    ai_generated_percent: 95
+    ai_assisted_percent: 0
+    human_only_percent: 5
+    method: self_reported
+    estimation_notes: >-
+      Self-assessment of the Rust, C++, shell and Python sources of this
+      repository, excluding the sources fetched at build time.
+  generated_content:
+    documentation_percent: 95
+    artifacts:
+      - README.md
+  components:
+    - name: crates/wavelab, crates/wavelab-cli
+      description: Device-agnostic measures (probe and criteria, null test, error-to-signal ratio, noise-to-mask ratio, deltas)
+      ai_involvement: written by the AI agent, directed by the maintainer
+      tools_used: [Claude Code]
+      notes: >-
+        The noise-to-mask ratio implements the published description of the
+        PEAQ ear model; it has not been run against the standard's
+        conformance set.
+    - name: crates/spice-lab
+      description: LiveSPICE schematic converter, ngspice comparison harness, benchmarks for robine-spice
+      ai_involvement: written by the AI agent, directed by the maintainer
+      tools_used: [Claude Code]
+    - name: crates/nam-lab, crates/nam-reference-sys
+      description: Measurement CLI for robine-nam and FFI to the upstream C++ reference
+      ai_involvement: written by the AI agent, reviewed by the maintainer
+      tools_used: [Claude Code]
+    - name: crates/nam-reference-sys/vendor/NeuralAmpModelerCore
+      description: Upstream reference implementation (fetched at a pinned commit, not committed; MIT, Steven Atkinson)
+      ai_involvement: third-party code, not produced by this project
+    - name: peaq/vendor/gstpeaq
+      description: GstPEAQ, open-source PEAQ implementation (fetched at a pinned commit, not committed; LGPL, Martin Holters)
+      ai_involvement: third-party code, not produced by this project
+      notes: Used as an external program; the build script around it was written by the AI agent.
+
+data_handling:
+  data_classification: public
+  categories_sent:
+    - source code of this repository
+    - build and test output
+    - public documentation and source code of NeuralAmpModelerCore, LiveSPICE and GstPEAQ
+  personal_data_sent: false
+
+declaration:
+  date: "2026-10-13"
+  declared_by: Guillaume Bailleul
+  notes: >-
+    Percentages are a self-assessment of the authorship of the text in this
+    repository (code fetched at build time excluded). Update this file when
+    the pattern of AI usage changes, not on every commit.

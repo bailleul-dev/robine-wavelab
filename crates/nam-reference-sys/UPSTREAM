@@ -1,0 +1,6 @@
+# Upstream reference implementation used as the correctness and performance oracle.
+# Fetched by vendor.sh into vendor/ (git-ignored). Bump the commit to compare
+# against a newer NeuralAmpModelerCore.
+UPSTREAM_URL=https://github.com/sdatkinson/NeuralAmpModelerCore.git
+UPSTREAM_COMMIT=0b3d3c97b0859a3a8c92a8628c4dd89a25eb5842
+UPSTREAM_DATE=2026-09-18

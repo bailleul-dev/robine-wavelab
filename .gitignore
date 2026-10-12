@@ -1,0 +1,9 @@
+/target
+/peaq/vendor/
+/peaq/build/
+/crates/nam-reference-sys/vendor/
+/out/
+*.tmp
+.DS_Store
+__pycache__/
+*.pyc

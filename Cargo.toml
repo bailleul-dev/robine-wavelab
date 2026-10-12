@@ -1,0 +1,18 @@
+# Measurement tooling for the robine audio libraries, which are expected to
+# be checked out next to this repository (../robine-spice, ../robine-nam).
+[workspace]
+resolver = "2"
+members = ["crates/wavelab", "crates/wavelab-cli", "crates/spice-lab", "crates/nam-reference-sys", "crates/nam-lab"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/bailleul-dev/robine-wavelab"
+authors = ["Guillaume Bailleul"]
+
+# Timings are only meaningful in release builds.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
