@@ -15,7 +15,7 @@ Three command-line tools over one library:
 | tool | what it does |
 |------|--------------|
 | `wavelab` | measures on audio files, whatever produced them: `probe`, `judge`, `null` |
-| `spice-lab` | robine-spice: `convert` LiveSPICE schematics, `inspect`, `render`, `compare` with ngspice, `survey`, `bench`, `golden` |
+| `spice-lab` | robine-spice: `convert` LiveSPICE schematics, `inspect`, `render`, `compare` with ngspice, `survey`, `bench`, `golden`, `alias` (aliasing against a run at a higher rate) |
 | `nam-lab` | robine-nam: `inspect`, `render`, `compare` with the upstream NeuralAmpModelerCore, `compare-wav`, `bench`, `golden` |
 
 ## Setting up
@@ -162,7 +162,7 @@ compare timings on a laptop.
 ```
 crates/wavelab/            the library: probe and criteria, null test, ESR, noise-to-mask ratio, PEAQ runner, deltas, WAV, test signals
 crates/wavelab-cli/        `wavelab`
-crates/spice-lab/          `spice-lab`, with the LiveSPICE converter and the ngspice runner
+crates/spice-lab/          `spice-lab`, with the ngspice runner (the LiveSPICE converter is robine-spice's schematic crate)
 crates/nam-lab/            `nam-lab`
 crates/nam-reference-sys/  the upstream NAM reference, built from pinned sources
 peaq/setup.sh              builds GstPEAQ from pinned sources into peaq/build

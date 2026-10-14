@@ -1,11 +1,11 @@
-use crate::{ngspice, schx};
+use crate::ngspice;
 use clap::Args;
 use robine_spice::{Circuit, ControlKind, Guitar, Integration, Processor, Source};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use wavelab::{signal, wav};
 
-type CmdResult = Result<bool, String>;
+pub type CmdResult = Result<bool, String>;
 
 fn load(path: &Path) -> Result<Circuit, String> {
     let circuit = Circuit::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -34,14 +34,14 @@ fn parse_source(text: &str) -> Result<Source, String> {
     })
 }
 
-fn load_with(path: &Path, source: &str) -> Result<Circuit, String> {
+pub fn load_with(path: &Path, source: &str) -> Result<Circuit, String> {
     load(path)?
         .with_source(parse_source(source)?)
         .map_err(|e| e.to_string())
 }
 
 /// Control positions after applying `name=value` overrides.
-fn positions(circuit: &Circuit, sets: &[String]) -> Result<Vec<f64>, String> {
+pub fn positions(circuit: &Circuit, sets: &[String]) -> Result<Vec<f64>, String> {
     let mut positions: Vec<f64> = circuit.controls().iter().map(|c| c.value).collect();
     for set in sets {
         let (name, value) = set
@@ -72,7 +72,7 @@ fn integration() -> Integration {
     }
 }
 
-fn build(circuit: &Circuit, rate: f64, positions: &[f64]) -> Result<Processor, String> {
+pub fn build(circuit: &Circuit, rate: f64, positions: &[f64]) -> Result<Processor, String> {
     let mut processor = circuit
         .build_with(rate, integration())
         .map_err(|e| e.to_string())?;
@@ -109,7 +109,7 @@ pub fn convert(args: ConvertArgs) -> CmdResult {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let netlist = schx::convert(&xml, &source)?;
+    let netlist = robine_spice_schematic::Schematic::parse(&xml)?.to_netlist(&source)?;
     // Refuse to write something the library would not read back.
     let circuit =
         Circuit::parse(&netlist).map_err(|e| format!("converted netlist is invalid: {e}"))?;
@@ -181,6 +181,13 @@ pub fn inspect(args: InspectArgs) -> CmdResult {
                 min_seconds * 1e3,
                 max_seconds * 1e3,
                 c.value
+            ),
+            ControlKind::Rate {
+                min_hertz,
+                max_hertz,
+            } => println!(
+                "control   {:<12} rate {min_hertz} to {max_hertz} Hz  at {}",
+                c.name, c.value
             ),
         }
     }

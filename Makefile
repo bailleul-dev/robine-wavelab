@@ -99,6 +99,9 @@ spice-golden: build
 	$(SPICE_GOLDEN) -c $(CIRCUITS)/pro-co-rat.cir --name pro-co-rat --peak 0.3 --ngspice-reltol 1e-5
 	$(SPICE_GOLDEN) -c $(CIRCUITS)/marshall-jcm800-2203-preamp.cir --name marshall-jcm800-2203-preamp --peak 0.2 --ngspice-reltol 1e-5
 	$(SPICE_GOLDEN) -c $(CIRCUITS)/fender-5e3.cir --name fender-5e3 --peak 0.5 --seconds 0.02 --ngspice-reltol 1e-5
+	$(SPICE_GOLDEN) -c $(CIRCUITS)/robine-mosfet-overdrive.cir --name robine-mosfet-overdrive --peak 1 --ngspice-reltol 1e-6
+	$(SPICE_GOLDEN) -c $(CIRCUITS)/robine-treble-booster.cir --name robine-treble-booster --peak 0.3 --ngspice-reltol 1e-6
+	$(SPICE_GOLDEN) -c $(CIRCUITS)/klon-centaur.cir --name klon-centaur --peak 0.5 --ngspice-reltol 1e-6
 
 ## Regenerate robine-spice's netlists from the LiveSPICE schematics
 spice-convert: build

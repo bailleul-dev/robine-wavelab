@@ -1,6 +1,6 @@
+mod alias;
 mod commands;
 mod ngspice;
-mod schx;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -31,6 +31,8 @@ enum Command {
     Survey(commands::SurveyArgs),
     /// Write golden fixtures (input and ngspice output) for `cargo test`.
     Golden(commands::GoldenArgs),
+    /// How much aliasing a circuit makes, against a run at a higher rate.
+    Alias(alias::AliasArgs),
 }
 
 fn main() -> ExitCode {
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
         Command::Bench(a) => commands::bench(a),
         Command::Survey(a) => commands::survey(a),
         Command::Golden(a) => commands::golden(a),
+        Command::Alias(a) => alias::alias(a),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
