@@ -1,5 +1,7 @@
 mod alias;
 mod commands;
+mod dk;
+mod model;
 mod ngspice;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +35,8 @@ enum Command {
     Golden(commands::GoldenArgs),
     /// How much aliasing a circuit makes, against a run at a higher rate.
     Alias(alias::AliasArgs),
+    /// Export the reduced linear system, optionally with a traced run.
+    Dk(dk::DkArgs),
 }
 
 fn main() -> ExitCode {
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
         Command::Survey(a) => commands::survey(a),
         Command::Golden(a) => commands::golden(a),
         Command::Alias(a) => alias::alias(a),
+        Command::Dk(a) => dk::dk(a),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,

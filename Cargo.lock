@@ -333,6 +333,8 @@ dependencies = [
  "realfft",
  "robine-spice",
  "robine-spice-schematic",
+ "serde",
+ "serde_json",
  "wavelab",
 ]
 
