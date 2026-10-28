@@ -22,7 +22,7 @@ INPUT     ?= $(ASSETS)/inputs/Brit - Guitar.wav
 
 .PHONY: all build test fmt clippy clean peaq judge aidecl-check \
 	spice-compare spice-survey spice-bench spice-golden spice-convert spice-listen \
-	spice-grade-measure spice-grade-device spice-grade-check spice-grade-table \
+	spice-tools spice-grade-measure spice-grade-device spice-grade-check spice-grade-table \
 	nam-compare nam-compare-wav nam-bench nam-golden nam-listen
 
 all: build
@@ -92,26 +92,30 @@ spice-bench: build
 	$(SPICE_LAB) bench -c $(CIRCUITS)/mxr-distortion-plus.cir
 	$(SPICE_LAB) bench -c $(CIRCUITS)/big-muff-pi.cir --peak 0.3
 
+## The tools robine-spice needs, without the NAM reference (which `build` fetches)
+spice-tools:
+	cargo build --release -p spice-lab -p wavelab-cli
+
 ## Grades of the circuits, from F to A+ (see $(CIRCUITS)/GRADES.md): the evidence
 ## and the grades are in $(CIRCUITS)/grades.json.
 ## Measure the solver, ngspice and the controls (needs ngspice; minutes per circuit
 ## with many controls). All circuits, or ONLY="big-muff-pi fuzz-face".
-spice-grade-measure: build
+spice-grade-measure: spice-tools
 	$(SPICE_LAB) grade measure --circuits $(CIRCUITS) $(foreach c,$(ONLY),--only $(c))
 
 ## Record a comparison with a real device, from `wavelab null --json --peaq`:
 ##   make spice-grade-device CIRCUIT=big-muff-pi.cir CAPTURE="nyc.nam (TONE3000 #123)" \
 ##     SET="Sustain=0.7 Tone=0.5" NULL=out/null.json
-spice-grade-device: build
+spice-grade-device: spice-tools
 	$(SPICE_LAB) grade device --circuits $(CIRCUITS) -c $(CIRCUITS)/$(CIRCUIT) \
 		--capture "$(CAPTURE)" $(foreach s,$(SET),--set $(s)) --null $(NULL)
 
 ## The stored grades are what their evidence gives (exit code != 0 if not)
-spice-grade-check: build
+spice-grade-check: spice-tools
 	$(SPICE_LAB) grade rate --circuits $(CIRCUITS) --check
 
 ## Rate again, and write the table of the circuits README
-spice-grade-table: build
+spice-grade-table: spice-tools
 	$(SPICE_LAB) grade rate --circuits $(CIRCUITS)
 	$(SPICE_LAB) grade table --circuits $(CIRCUITS) --readme $(CIRCUITS)/README.md
 
