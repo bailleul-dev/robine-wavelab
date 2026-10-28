@@ -1,8 +1,10 @@
 mod alias;
 mod commands;
 mod dk;
+mod grade;
 mod model;
 mod ngspice;
+mod rating;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -35,6 +37,8 @@ enum Command {
     Golden(commands::GoldenArgs),
     /// How much aliasing a circuit makes, against a run at a higher rate.
     Alias(alias::AliasArgs),
+    /// Grade the models from F to A+: measure, record, rate, tabulate.
+    Grade(grade::GradeArgs),
     /// Export the reduced linear system, optionally with a traced run.
     Dk(dk::DkArgs),
 }
@@ -54,6 +58,7 @@ fn main() -> ExitCode {
         Command::Survey(a) => commands::survey(a),
         Command::Golden(a) => commands::golden(a),
         Command::Alias(a) => alias::alias(a),
+        Command::Grade(a) => grade::grade(a),
         Command::Dk(a) => dk::dk(a),
     };
     match result {

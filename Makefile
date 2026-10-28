@@ -22,6 +22,7 @@ INPUT     ?= $(ASSETS)/inputs/Brit - Guitar.wav
 
 .PHONY: all build test fmt clippy clean peaq judge aidecl-check \
 	spice-compare spice-survey spice-bench spice-golden spice-convert spice-listen \
+	spice-grade-measure spice-grade-device spice-grade-check spice-grade-table \
 	nam-compare nam-compare-wav nam-bench nam-golden nam-listen
 
 all: build
@@ -90,6 +91,29 @@ spice-survey: build
 spice-bench: build
 	$(SPICE_LAB) bench -c $(CIRCUITS)/mxr-distortion-plus.cir
 	$(SPICE_LAB) bench -c $(CIRCUITS)/big-muff-pi.cir --peak 0.3
+
+## Grades of the circuits, from F to A+ (see $(CIRCUITS)/GRADES.md): the evidence
+## and the grades are in $(CIRCUITS)/grades.json.
+## Measure the solver, ngspice and the controls (needs ngspice; minutes per circuit
+## with many controls). All circuits, or ONLY="big-muff-pi fuzz-face".
+spice-grade-measure: build
+	$(SPICE_LAB) grade measure --circuits $(CIRCUITS) $(foreach c,$(ONLY),--only $(c))
+
+## Record a comparison with a real device, from `wavelab null --json --peaq`:
+##   make spice-grade-device CIRCUIT=big-muff-pi.cir CAPTURE="nyc.nam (TONE3000 #123)" \
+##     SET="Sustain=0.7 Tone=0.5" NULL=out/null.json
+spice-grade-device: build
+	$(SPICE_LAB) grade device --circuits $(CIRCUITS) -c $(CIRCUITS)/$(CIRCUIT) \
+		--capture "$(CAPTURE)" $(foreach s,$(SET),--set $(s)) --null $(NULL)
+
+## The stored grades are what their evidence gives (exit code != 0 if not)
+spice-grade-check: build
+	$(SPICE_LAB) grade rate --circuits $(CIRCUITS) --check
+
+## Rate again, and write the table of the circuits README
+spice-grade-table: build
+	$(SPICE_LAB) grade rate --circuits $(CIRCUITS)
+	$(SPICE_LAB) grade table --circuits $(CIRCUITS) --readme $(CIRCUITS)/README.md
 
 ## Regenerate the golden fixtures of robine-spice's `cargo test` (runs ngspice)
 SPICE_GOLDEN = $(SPICE_LAB) golden -o $(SPICE_FIX)

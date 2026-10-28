@@ -387,13 +387,13 @@ pub struct CompareArgs {
     trace: bool,
 }
 
-struct Delta {
-    max_abs: f64,
-    relative_db: f64,
-    signal_rms: f64,
+pub(crate) struct Delta {
+    pub max_abs: f64,
+    pub relative_db: f64,
+    pub signal_rms: f64,
 }
 
-fn delta(ours: &[f64], reference: &[f64]) -> Delta {
+pub(crate) fn delta(ours: &[f64], reference: &[f64]) -> Delta {
     let mean = reference.iter().sum::<f64>() / reference.len() as f64;
     let signal_rms = rms(reference.iter().map(|v| v - mean));
     let error_rms = rms(ours.iter().zip(reference).map(|(a, b)| a - b));
@@ -407,7 +407,7 @@ fn delta(ours: &[f64], reference: &[f64]) -> Delta {
     }
 }
 
-fn run_ours(processor: &mut Processor, input: &[f64]) -> Vec<f64> {
+pub(crate) fn run_ours(processor: &mut Processor, input: &[f64]) -> Vec<f64> {
     input
         .iter()
         .map(|&x| f64::from(processor.process_sample(x as f32)))
@@ -663,7 +663,7 @@ pub struct SurveyArgs {
     work_dir: PathBuf,
 }
 
-fn netlists(directory: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn netlists(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let list = |dir: &Path| -> Result<Vec<PathBuf>, String> {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?

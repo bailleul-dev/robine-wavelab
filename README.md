@@ -15,7 +15,7 @@ Three command-line tools over one library:
 | tool | what it does |
 |------|--------------|
 | `wavelab` | measures on audio files, whatever produced them: `probe`, `judge`, `null` |
-| `spice-lab` | robine-spice: `convert` LiveSPICE schematics, `inspect`, `render`, `compare` with ngspice, `survey`, `bench`, `golden`, `alias` (aliasing against a run at a higher rate) |
+| `spice-lab` | robine-spice: `convert` LiveSPICE schematics, `inspect`, `render`, `compare` with ngspice, `survey`, `bench`, `golden`, `alias` (aliasing against a run at a higher rate), `grade` (F to A+) |
 | `nam-lab` | robine-nam: `inspect`, `render`, `compare` with the upstream NeuralAmpModelerCore, `compare-wav`, `bench`, `golden` |
 
 ## Setting up
@@ -132,11 +132,24 @@ make spice-bench      # throughput and cost of a control move
 make spice-listen     # every circuit rendered to out/listen/spice
 make spice-golden     # regenerate the fixtures of robine-spice's tests (runs ngspice)
 make spice-convert    # regenerate its netlists from a LiveSPICE checkout
+make spice-grade-measure  # grade the circuits: solver, ngspice and controls (needs ngspice)
+make spice-grade-device   # record a comparison with a real device
+make spice-grade-check    # the stored grades are what their evidence gives
+make spice-grade-table    # the table of grades in robine-spice's circuits/README.md
 ```
 
 `spice-lab compare` gives ngspice the same flattened circuit and the same
 samples, lets it solve with a time step at least eight times finer, and
-compares at every sample time. `spice-lab render` takes `--set
+compares at every sample time. `spice-lab grade` keeps how far each circuit is known to be right, from `F` to
+`A+` or unknown, in `circuits/grades.json` of robine-spice: `measure` runs the
+circuits against ngspice and moves their controls, `device` records a
+comparison with a real device from `wavelab null --json`, `rate` rates the
+evidence again and writes each grade into its netlist as `* grade:` comment
+lines, `table` writes the README. The rubric is in
+`robine-spice/circuits/GRADES.md`; the rating is a function of the evidence
+(`crates/spice-lab/src/rating.rs`) and does not need ngspice to be tested.
+
+`spice-lab render` takes `--set
 Control=value`, `--source buffer|single-coil|humbucker`, `--sweep
 Control=low:high:hertz` to move a control while rendering, and `--normalize`.
 
