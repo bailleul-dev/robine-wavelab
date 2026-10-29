@@ -96,7 +96,7 @@ spice-bench: build
 spice-tools:
 	cargo build --release -p spice-lab -p wavelab-cli
 
-## Grades of the circuits, from F to A+ (see $(CIRCUITS)/GRADES.md): the evidence
+## Grades of the circuits, from tin to platinum (see $(CIRCUITS)/GRADES.md): the evidence
 ## and the grades are in $(CIRCUITS)/grades.json.
 ## Measure the solver, ngspice and the controls (needs ngspice; minutes per circuit
 ## with many controls). All circuits, or ONLY="big-muff-pi fuzz-face".

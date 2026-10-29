@@ -1,5 +1,5 @@
-//! `spice-lab grade`: how far each circuit is known to be right, from F to
-//! A+ or unknown.
+//! `spice-lab grade`: how far each circuit is known to be right, a medal
+//! from tin to platinum, or none (unknown, broken).
 //!
 //! The grades live in `grades.json` next to the netlists, as the evidence
 //! they were rated from and the rating itself (`rating.rs`). `measure`
@@ -686,10 +686,10 @@ mod tests {
             "Fuzz Face\n* grade: unknown\n* grade-why: not measured\n* Converted by someone\nR1 a b 1\n"
         );
         assert_eq!(with_grade(&once, Some(&entry)), once);
-        entry.grade = Grade::B;
+        entry.grade = Grade::Silver;
         entry.reason = "because".into();
         let twice = with_grade(&once, Some(&entry));
-        assert!(twice.contains("* grade: B\n* grade-why: because\n"));
+        assert!(twice.contains("* grade: silver\n* grade-why: because\n"));
         assert_eq!(twice.matches("* grade").count(), 2);
         assert_eq!(without_grade(&twice), netlist);
     }
@@ -732,7 +732,7 @@ mod tests {
         };
         let mut entry = Entry::rated(evidence);
         assert!(entry.consistent());
-        entry.grade = Grade::A;
+        entry.grade = Grade::Gold;
         assert!(!entry.consistent());
     }
 

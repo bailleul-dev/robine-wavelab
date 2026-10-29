@@ -37,7 +37,7 @@ enum Command {
     Golden(commands::GoldenArgs),
     /// How much aliasing a circuit makes, against a run at a higher rate.
     Alias(alias::AliasArgs),
-    /// Grade the models from F to A+: measure, record, rate, tabulate.
+    /// Grade the models from tin to platinum: measure, record, rate, tabulate.
     Grade(grade::GradeArgs),
     /// Export the reduced linear system, optionally with a traced run.
     Dk(dk::DkArgs),
