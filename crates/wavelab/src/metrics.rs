@@ -143,6 +143,9 @@ pub fn estimate_lag(candidate: &[f32], reference: &[f32], max_lag: usize) -> i64
     let mut prod: Vec<Complex<f64>> = fa.iter().zip(&fb).map(|(x, y)| x * y.conj()).collect();
     let mut corr = vec![0.0f64; size];
     ifft.process(&mut prod, &mut corr).unwrap();
+    // The largest correlation either way: a chain that inverts the signal
+    // (an output transformer wired the other way) is aligned too, and the
+    // gain fitted afterwards comes out negative.
     let mut best = 0i64;
     let mut best_val = f64::NEG_INFINITY;
     for lag in -(max_lag as i64)..=(max_lag as i64) {
@@ -151,8 +154,8 @@ pub fn estimate_lag(candidate: &[f32], reference: &[f32], max_lag: usize) -> i64
         } else {
             size - (-lag) as usize
         };
-        if corr[idx] > best_val {
-            best_val = corr[idx];
+        if corr[idx].abs() > best_val {
+            best_val = corr[idx].abs();
             best = lag;
         }
     }

@@ -250,23 +250,25 @@ fn hash_file(path: &Path) -> Result<String, String> {
 
 const GRADE_LINE: &str = "* grade: ";
 const WHY_LINE: &str = "* grade-why: ";
+const FACTS_LINE: &str = "* grade-facts: ";
 
 /// The netlist without the lines that carry its grade.
 fn without_grade(text: &str) -> String {
     text.split_inclusive('\n')
-        .filter(|l| !l.starts_with(GRADE_LINE) && !l.starts_with(WHY_LINE))
+        .filter(|l| ![GRADE_LINE, WHY_LINE, FACTS_LINE].iter().any(|p| l.starts_with(p)))
         .collect()
 }
 
 /// The netlist with its grade written after the title line.
 fn with_grade(text: &str, entry: Option<&Entry>) -> String {
-    let (grade, why) = entry.map_or((Grade::Unknown, "not measured"), |e| {
-        (e.grade, e.reason.as_str())
-    });
+    let (grade, why, facts) = entry.map_or(
+        (Grade::Unknown, "not measured", "measured=no".to_string()),
+        |e| (e.grade, e.reason.as_str(), rating::facts(&e.evidence, e.score)),
+    );
     let plain = without_grade(text);
     let (title, rest) = plain.split_once('\n').unwrap_or((plain.as_str(), ""));
     format!(
-        "{title}\n{GRADE_LINE}{}\n{WHY_LINE}{why}\n{rest}",
+        "{title}\n{GRADE_LINE}{}\n{WHY_LINE}{why}\n{FACTS_LINE}{facts}\n{rest}",
         grade.label()
     )
 }
@@ -390,7 +392,10 @@ fn evidence_of(path: &Path, name: &str, args: &MeasureArgs) -> Result<Evidence, 
             return Ok(evidence);
         }
     }
-    if args.no_ngspice {
+    // A deck that leaves part of the circuit out (a swept delay line: SPICE's
+    // has one length) is another circuit, and ngspice says nothing of this
+    // one: the axis is left unmeasured rather than counted as a failure.
+    if args.no_ngspice || circuit.to_spice(&rest).contains("is not written") {
         return Ok(evidence);
     }
     let dir = args.work_dir.join(name);
@@ -399,27 +404,40 @@ fn evidence_of(path: &Path, name: &str, args: &MeasureArgs) -> Result<Evidence, 
         db_192k: versus_ngspice(&circuit, &rest, HIGH_RATE, args, &dir.join("192k")),
     });
     if !args.no_controls {
-        let total = circuit.controls().len();
-        let verified = (0..total)
-            .filter(|&control| {
-                POSITIONS.iter().all(|&at| {
+        // Each control is verified, failed, or unmeasured where ngspice could
+        // not run it: only the first two count.
+        let checked: Vec<bool> = (0..circuit.controls().len())
+            .filter_map(|control| {
+                let mut unmeasured = false;
+                for &at in &POSITIONS {
                     let mut positions = rest.clone();
                     positions[control] = at;
                     let healthy = run(&circuit, &positions, args.seconds, args.peak)
                         .is_ok_and(|r| r.finite && r.unconverged == 0);
-                    healthy
-                        && versus_ngspice(
-                            &circuit,
-                            &positions,
-                            RATE,
-                            args,
-                            &dir.join(format!("control{control}-{at}")),
-                        )
-                        .is_some_and(|db| db <= CONTROL_DB)
-                })
+                    if !healthy {
+                        return Some(false);
+                    }
+                    match versus_ngspice(
+                        &circuit,
+                        &positions,
+                        RATE,
+                        args,
+                        &dir.join(format!("control{control}-{at}")),
+                    ) {
+                        Some(db) if db > CONTROL_DB => return Some(false),
+                        Some(_) => {}
+                        None => unmeasured = true,
+                    }
+                }
+                (!unmeasured).then_some(true)
             })
-            .count();
-        evidence.controls = Some(Controls { verified, total });
+            .collect();
+        if !checked.is_empty() {
+            evidence.controls = Some(Controls {
+                verified: checked.iter().filter(|&&v| v).count(),
+                total: checked.len(),
+            });
+        }
     }
     Ok(evidence)
 }
@@ -683,14 +701,14 @@ mod tests {
         let once = with_grade(netlist, Some(&entry));
         assert_eq!(
             once,
-            "Fuzz Face\n* grade: unknown\n* grade-why: not measured\n* Converted by someone\nR1 a b 1\n"
+            "Fuzz Face\n* grade: unknown\n* grade-why: not measured\n* grade-facts: measured=no\n* Converted by someone\nR1 a b 1\n"
         );
         assert_eq!(with_grade(&once, Some(&entry)), once);
         entry.grade = Grade::Silver;
         entry.reason = "because".into();
         let twice = with_grade(&once, Some(&entry));
         assert!(twice.contains("* grade: silver\n* grade-why: because\n"));
-        assert_eq!(twice.matches("* grade").count(), 2);
+        assert_eq!(twice.matches("* grade").count(), 3);
         assert_eq!(without_grade(&twice), netlist);
     }
 

@@ -239,6 +239,33 @@ fn from_score(score: f64) -> Grade {
     }
 }
 
+/// What a grade rests on, as `key=value` words a reader of the netlist (the
+/// app) can say in its own words: the score, the distance from ngspice at
+/// 48 kHz, how many distinct settings were compared with a real device and
+/// how many of them are close. A key is left out when nothing measured it;
+/// `measured=no` when even the solver was not run.
+pub fn facts(e: &Evidence, score: Option<f64>) -> String {
+    if e.solver.is_none() {
+        return "measured=no".into();
+    }
+    let mut words = Vec::new();
+    if let Some(score) = score {
+        words.push(format!("score={score:.0}"));
+    }
+    if let Some(db) = e.ngspice.as_ref().and_then(|n| n.db_48k) {
+        words.push(format!("ngspice={db:.1}"));
+    }
+    let mut compared: Vec<&BTreeMap<String, f64>> = Vec::new();
+    for d in &e.devices {
+        if !compared.contains(&&d.setting) {
+            compared.push(&d.setting);
+        }
+    }
+    words.push(format!("compared={}", compared.len()));
+    words.push(format!("close={}", close_settings(&e.devices)));
+    words.join(" ")
+}
+
 /// Distinct settings among the close comparisons with a device.
 fn close_settings(devices: &[Device]) -> usize {
     let mut seen: Vec<&BTreeMap<String, f64>> = Vec::new();

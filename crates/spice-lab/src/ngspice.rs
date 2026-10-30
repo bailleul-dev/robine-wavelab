@@ -46,6 +46,7 @@ pub fn deck(
     rate: f64,
     data: &Path,
     (reltol, abstol, vntol): (f64, f64, f64),
+    method: &str,
 ) -> String {
     let source = circuit.input_source();
     let mut deck = String::new();
@@ -76,7 +77,7 @@ pub fn deck(
     let step = 1.0 / rate;
     let _ = write!(
         deck,
-        ".options reltol={reltol:e} abstol={abstol:e} vntol={vntol:e} method=trap\n\
+        ".options reltol={reltol:e} abstol={abstol:e} vntol={vntol:e} method={method}\n\
          .control\n\
          set numdgt=15\n\
          set wr_singlescale\n\
@@ -92,7 +93,13 @@ pub fn deck(
     deck
 }
 
-/// Run ngspice with the tightest tolerances it completes with.
+/// Integration methods, the more accurate first. Gear damps what trap lets
+/// ring, and completes some decks trap gives up on at every tolerance (a
+/// pentode plate, nearly a current source, into a transformer's leakage).
+const METHODS: [&str; 2] = ["trap", "gear"];
+
+/// Run ngspice with the tightest tolerances it completes with, by trap if it
+/// can.
 pub fn run(
     circuit: &Circuit,
     positions: &[f64],
@@ -105,17 +112,19 @@ pub fn run(
     let mut last = format!("no ngspice tolerance set is as loose as reltol={tightest:e}");
     // A set that fails can take a long time to fail: `tightest` lets the
     // caller skip the ones known not to complete for a circuit.
-    for tolerances in TOLERANCES.into_iter().filter(|t| t.0 >= tightest * 0.999) {
-        match attempt(circuit, positions, input, rate, dir, tolerances) {
-            Ok(output) => {
-                return Ok(Reference {
-                    output,
-                    reltol: tolerances.0,
-                })
+    for method in METHODS {
+        for tolerances in TOLERANCES.into_iter().filter(|t| t.0 >= tightest * 0.999) {
+            match attempt(circuit, positions, input, rate, dir, tolerances, method) {
+                Ok(output) => {
+                    return Ok(Reference {
+                        output,
+                        reltol: tolerances.0,
+                    })
+                }
+                // Looser tolerances rarely rescue a run that was merely slow.
+                Err(e) if e.contains("did not finish") => return Err(e),
+                Err(e) => last = e,
             }
-            // Looser tolerances rarely rescue a run that was merely slow.
-            Err(e) if e.contains("did not finish") => return Err(e),
-            Err(e) => last = e,
         }
     }
     Err(last)
@@ -128,11 +137,12 @@ fn attempt(
     rate: f64,
     dir: &Path,
     tolerances: (f64, f64, f64),
+    method: &str,
 ) -> Result<Vec<f64>, String> {
     let deck_path = dir.join("deck.cir");
     let data_path = dir.join("out.data");
     let _ = std::fs::remove_file(&data_path);
-    let text = deck(circuit, positions, input, rate, &data_path, tolerances);
+    let text = deck(circuit, positions, input, rate, &data_path, tolerances, method);
     std::fs::write(&deck_path, text).map_err(|e| format!("{}: {e}", deck_path.display()))?;
     let log_path = dir.join("ngspice.log");
     let log =
