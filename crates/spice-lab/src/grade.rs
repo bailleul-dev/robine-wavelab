@@ -537,10 +537,7 @@ fn device(args: DeviceArgs) -> CmdResult {
         measured: Some(today()),
         netlist_hash: Some(hash_file(&args.circuit)?),
     };
-    evidence
-        .devices
-        .retain(|d| !(d.capture == record.capture && d.setting == record.setting));
-    evidence.devices.push(record);
+    record_device(&mut evidence.devices, record);
     let entry = Entry::rated(evidence);
     println!("{name}: {} ({})", entry.grade.label(), entry.reason);
     write_grade(&args.circuit, Some(&entry))?;
@@ -548,6 +545,15 @@ fn device(args: DeviceArgs) -> CmdResult {
     store.rubric = RUBRIC;
     store.write(&file)?;
     Ok(true)
+}
+
+/// A capture is one device at one setting: measuring it again replaces what
+/// it said before, also when the circuit is now set otherwise for it (a
+/// position read again through another taper), so that the old comparison
+/// does not stay counted beside the new one.
+fn record_device(devices: &mut Vec<Device>, record: Device) {
+    devices.retain(|d| d.capture != record.capture);
+    devices.push(record);
 }
 
 // ---------------------------------------------------------------------- rate
@@ -670,6 +676,25 @@ fn table(args: TableArgs) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capture_measured_again_replaces_its_comparison_at_any_setting() {
+        let device = |capture: &str, gain: f64, esr: f64| Device {
+            capture: capture.into(),
+            setting: BTreeMap::from([("Gain".to_string(), gain)]),
+            esr_preemphasis_db: esr,
+            nmr_db: 0.0,
+            disturbed_frames: 0.5,
+            peaq_odg: None,
+            measured: None,
+            netlist_hash: None,
+        };
+        let mut devices = vec![device("a.nam", 0.247, -5.0), device("b.nam", 0.5, -6.0)];
+        record_device(&mut devices, device("a.nam", 0.5, -7.0));
+        assert_eq!(devices.len(), 2);
+        let a = devices.iter().find(|d| d.capture == "a.nam").unwrap();
+        assert_eq!((a.setting["Gain"], a.esr_preemphasis_db), (0.5, -7.0));
+    }
 
     #[test]
     fn names_are_paths_without_extension() {
