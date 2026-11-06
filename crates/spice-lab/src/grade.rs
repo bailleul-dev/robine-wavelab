@@ -236,11 +236,13 @@ fn name_of(directory: &Path, path: &Path) -> String {
 /// FNV-1a over the bytes of the netlist: not a secret, a change detector
 /// that gives the same answer on every machine and every toolchain.
 ///
-/// The two comment lines that carry the grade are not part of what is
-/// hashed: writing a grade does not change the circuit it is about.
+/// The comment lines that carry the grade are not part of what is
+/// hashed: writing a grade does not change the circuit it is about. Nor is
+/// the `* loudness:` line, which says how loud the circuit comes out
+/// (robine-studio's ENG-016.9) and is measured from it, not part of it.
 fn hash_file(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let hash = without_grade(&text)
+    let hash = hashed_part(&text)
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -248,6 +250,16 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(format!("{hash:016x}"))
 }
 
+/// The netlist as the change detector sees it: without its grade and
+/// without its loudness line.
+fn hashed_part(text: &str) -> String {
+    without_grade(text)
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with(LOUDNESS_LINE))
+        .collect()
+}
+
+const LOUDNESS_LINE: &str = "* loudness: ";
 const GRADE_LINE: &str = "* grade: ";
 const WHY_LINE: &str = "* grade-why: ";
 const FACTS_LINE: &str = "* grade-facts: ";
@@ -717,6 +729,19 @@ mod tests {
         let file = dir.join("a.cir");
         std::fs::write(&file, "a").unwrap();
         assert_eq!(hash_file(&file).unwrap(), "af63dc4c8601ec8c");
+    }
+
+    #[test]
+    fn a_loudness_line_does_not_make_a_measured_netlist_stale() {
+        let dir = std::env::temp_dir().join("spice-lab-grade-loudness");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (plain, loud) = (dir.join("plain.cir"), dir.join("loud.cir"));
+        let netlist = |r: &str, loudness: &str| format!("AC30\n* rated: 30 W\n{loudness}R1 a b {r}\n");
+        std::fs::write(&plain, netlist("1", "")).unwrap();
+        std::fs::write(&loud, netlist("1", "* loudness: -1.1 dB\n")).unwrap();
+        assert_eq!(hash_file(&plain).unwrap(), hash_file(&loud).unwrap());
+        std::fs::write(&loud, netlist("2", "* loudness: -1.1 dB\n")).unwrap();
+        assert_ne!(hash_file(&plain).unwrap(), hash_file(&loud).unwrap());
     }
 
     #[test]
