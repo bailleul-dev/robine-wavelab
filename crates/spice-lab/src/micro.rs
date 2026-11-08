@@ -19,7 +19,8 @@
 
 use crate::commands::{build, load_with, positions, CmdResult};
 use crate::nn::{
-    db, esr, excitation, pick, threads, weighted_gradient, Adam, Grads, Kind, Net, Rng,
+    db, esr, excitation, pick, sobolev_gradient, threads, weighted_gradient, Adam, Grads, Kind, Net,
+    Rng,
 };
 use clap::Args;
 use robine_spice::{write_set, MicroNet, Processor, MAX_WIDTH};
@@ -66,8 +67,8 @@ pub struct MicroTrainArgs {
     #[arg(long, default_value = "median")]
     current_scale: String,
     /// Sizes of the hidden layers, comma separated (at most 32 wide). When
-    /// not given, each device gets the narrowest of a ladder of two-layer
-    /// sizes that is within `--size-slack` of the best of them.
+    /// not given, each device gets the narrowest of a ladder of sizes (three
+    /// layers of 32 or 24, then two layers from 32 down to 4) that is within `--size-slack` of the best of them.
     #[arg(long, value_delimiter = ',')]
     hidden: Vec<usize>,
     /// How much worse than the best size a narrower network may be, at the
@@ -76,6 +77,15 @@ pub struct MicroTrainArgs {
     /// the circuit (the AC30 sized at 2 went from -31 to -24 dB at worst).
     #[arg(long, default_value_t = 1.0)]
     size_slack: f64,
+    /// Teach each network the slopes of its law as well as its values
+    /// (Sobolev training), with this weight against the values; 0 for the
+    /// values alone. Newton solves with a network's Jacobian: values right
+    /// and slopes wrong leave it circling where the circuit collapses.
+    /// Not with `--data` (a measurement has no slopes). On an AC30 output
+    /// pentode alone in the circuit: 0 left 77 samples unconverged (-38.1
+    /// dB), 1 left none but blurred the values (-34.0), 0.3 none at -39.4.
+    #[arg(long, default_value_t = 0.3)]
+    slope_weight: f32,
     /// Samples of the circuit played to find where its devices work.
     #[arg(long, default_value_t = 600_000)]
     samples: usize,
@@ -559,6 +569,54 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
         });
         let weights = weights.as_deref();
 
+        // ---- the law's slopes, by central differences: in amps per volt
+        // (`law[r][c * ports + j]`, current c with voltage j) to judge the
+        // networks by, and standardised as the network sees them to teach
+        let law_slopes: Option<Vec<f64>> = args.data.is_none().then(|| {
+            let mut out = Vec::with_capacity(rows * ports * ports);
+            let (mut up, mut down) = (vec![0.0; ports], vec![0.0; ports]);
+            let mut at = vec![0.0; ports];
+            for row in table.v.chunks_exact(ports) {
+                let mut cols = vec![0.0; ports * ports];
+                for j in 0..ports {
+                    let h = 1e-4 * f64::from(input_scale[j]);
+                    at.copy_from_slice(row);
+                    at[j] = row[j] + h;
+                    template.device_law(k, &at, &mut up);
+                    at[j] = row[j] - h;
+                    template.device_law(k, &at, &mut down);
+                    for c in 0..ports {
+                        cols[c * ports + j] = (up[c] - down[c]) / (2.0 * h);
+                    }
+                }
+                out.extend_from_slice(&cols);
+            }
+            out
+        });
+        let slopes: Option<Vec<f32>> = law_slopes.as_ref().filter(|_| args.slope_weight > 0.0).map(|law| {
+            let mut out = vec![0.0f32; rows * ports * ports];
+            for r in 0..rows {
+                for c in 0..ports {
+                    let i = table.i[r * ports + c];
+                    let so = f64::from(output_scale[c]);
+                    // d asinh(i / so) / d i, and the standardising of both ends.
+                    let dy = 1.0 / (so * so + i * i).sqrt() / f64::from(y_scale[c]);
+                    for j in 0..ports {
+                        let g = law[r * ports * ports + c * ports + j];
+                        out[r * ports * ports + c * ports + j] =
+                            (g * dy * f64::from(input_scale[j])) as f32;
+                    }
+                }
+            }
+            out
+        });
+        let slopes = slopes.as_deref();
+        let biggest_slope: Vec<f64> = law_slopes.as_ref().map_or_else(Vec::new, |law| {
+            (0..ports * ports)
+                .map(|q| law.iter().skip(q).step_by(ports * ports).fold(0.0f64, |m, g| m.max(g.abs())))
+                .collect()
+        });
+
         // A tenth of the rows, drawn at random from both halves, are kept
         // back to judge it on.
         let mut all: Vec<usize> = (0..rows).collect();
@@ -571,7 +629,11 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
         // The sizes tried, widest first. A fixed `--hidden` is the only
         // one tried.
         let ladder: Vec<Vec<usize>> = if args.hidden.is_empty() {
-            [32, 24, 16, 12, 8, 6, 4].iter().map(|&w| vec![w, w]).collect()
+            // Three layers at the top: an AC30's driven stages fill a
+            // two-layer network of 32 and still want more.
+            let mut ladder = vec![vec![32, 32, 32], vec![24, 24, 24]];
+            ladder.extend([32, 24, 16, 12, 8, 6, 4].iter().map(|&w| vec![w, w]));
+            ladder
         } else {
             vec![args.hidden.clone()]
         };
@@ -607,8 +669,21 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                             .chunks(chunk)
                             .map(|part| {
                                 let (net, xn, ys) = (&net, &xn, &ys);
-                                scope
-                                    .spawn(move || weighted_gradient(net, xn, ys, weights, part, scale))
+                                scope.spawn(move || match slopes {
+                                    Some(slopes) => {
+                                        let (v, s, g) = sobolev_gradient(
+                                            net,
+                                            xn,
+                                            ys,
+                                            slopes,
+                                            args.slope_weight,
+                                            part,
+                                            scale,
+                                        );
+                                        (v + s, g)
+                                    }
+                                    None => weighted_gradient(net, xn, ys, weights, part, scale),
+                                })
                             })
                             .collect();
                         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -625,7 +700,21 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                     done += 1.0;
                 }
                 if epoch + 1 == args.epochs || (epoch + 1) % 10 == 0 {
-                    let (held_loss, _) = weighted_gradient(&net, &xn, &ys, weights, &held_rows, 0.0);
+                    let held_loss = match slopes {
+                        Some(slopes) => {
+                            let (v, s, _) = sobolev_gradient(
+                                &net,
+                                &xn,
+                                &ys,
+                                slopes,
+                                args.slope_weight,
+                                &held_rows,
+                                0.0,
+                            );
+                            v + s
+                        }
+                        None => weighted_gradient(&net, &xn, &ys, weights, &held_rows, 0.0).0,
+                    };
                     last = (
                         loss / (steps_per_epoch * args.batch * ports) as f64,
                         held_loss / (held_rows.len() * ports) as f64,
@@ -683,8 +772,31 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
             let mut errors: Vec<Vec<f64>> = vec![Vec::new(); 2 * ports];
             let mut got = vec![0.0; ports];
             let mut j = [0.0; 9];
+            // The slopes along the circuit, each against the law's (relative
+            // to it or to 1% of its largest), and how often the network
+            // turns a port's own conductance negative where the law's is not.
+            let mut slope_errors: Vec<f64> = Vec::new();
+            let (mut negative, mut along_rows) = (0usize, 0usize);
             for &r in &held_rows {
                 micro.eval(&table.v[r * ports..(r + 1) * ports], &mut got, &mut j);
+                if let (Some(law), true) = (&law_slopes, r < along) {
+                    along_rows += 1;
+                    let mut worst = 0.0f64;
+                    for c in 0..ports {
+                        for q in 0..ports {
+                            let want = law[r * ports * ports + c * ports + q];
+                            let have = j[3 * c + q];
+                            let big = biggest_slope[c * ports + q];
+                            if big > 0.0 {
+                                worst = worst.max((have - want).abs() / (want.abs() + 0.01 * big));
+                            }
+                            if c == q && want >= 0.0 && have < -1e-3 * big {
+                                negative += 1;
+                            }
+                        }
+                    }
+                    slope_errors.push(worst);
+                }
                 let group = usize::from(r >= along);
                 for c in 0..ports {
                     let want = table.i[r * ports + c];
@@ -711,14 +823,31 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                 }
                 println!("{line}");
             }
+            let slope_score = if slope_errors.is_empty() {
+                0.0
+            } else {
+                slope_errors.sort_by(f64::total_cmp);
+                let at = |q: f64| slope_errors[((slope_errors.len() - 1) as f64 * q) as usize];
+                println!(
+                    "    slopes along the circuit: {:.1e} / {:.1e} / {:.1e}, a port's own conductance negative where the law's is not: {} of {} rows",
+                    at(0.5),
+                    at(0.99),
+                    at(1.0),
+                    negative,
+                    along_rows
+                );
+                at(0.99)
+            };
             // What it is judged on: its worst port, at the 99th percentile,
-            // where the circuit goes.
+            // where the circuit goes, and, when it was taught them, its
+            // slopes there too.
             let score = (0..ports)
                 .filter_map(|c| {
                     let e = &errors[c];
                     (!e.is_empty()).then(|| e[((e.len() - 1) as f64 * 0.99) as usize])
                 })
                 .fold(0.0f64, f64::max);
+            let score = if slopes.is_some() { score.max(slope_score) } else { score };
             tried.push((score, micro, hidden.clone()));
         }
         // The narrowest within `size_slack` of the best of them all: one

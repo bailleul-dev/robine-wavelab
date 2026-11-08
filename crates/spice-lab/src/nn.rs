@@ -490,6 +490,131 @@ pub(crate) fn weighted_gradient(
     (loss, grads)
 }
 
+/// The activation's second derivative, `-16x(9-x^2) / (3(3+x^2)^3)` inside
+/// its knees and nothing past them (its slope is `((9-x^2) / (3(3+x^2)))^2`).
+fn activation_curve(x: f32) -> f32 {
+    if x.abs() >= 3.0 {
+        return 0.0;
+    }
+    let x2 = x * x;
+    let d = 3.0 + x2;
+    -16.0 * x * (9.0 - x2) / (3.0 * d * d * d)
+}
+
+/// Loss and gradient when the network is taught the slopes of what it
+/// learns as well as its values (Sobolev training): `slopes` holds, per
+/// row, `d y[c] / d x[j]` at `c * inputs + j`, and each is matched with
+/// a weight of `slope_weight / (1 + slope^2)`, absolute where the target
+/// is flat and relative where it is steep. A solver that takes a
+/// network's Jacobian for the law's needs it right, not only its values.
+/// Returns the value loss, the slope loss and the gradient of their sum.
+pub(crate) fn sobolev_gradient(
+    net: &Net,
+    x: &[f32],
+    y: &[f32],
+    slopes: &[f32],
+    slope_weight: f32,
+    rows: &[usize],
+    scale: f32,
+) -> (f64, f64, Grads) {
+    let inputs = net.sizes[0];
+    let outputs = *net.sizes.last().unwrap();
+    let mut grads = Grads::zeros(net);
+    let last = net.layers() - 1;
+    let mut z: Vec<Vec<f32>> = net.sizes[1..].iter().map(|&s| vec![0.0; s]).collect();
+    let mut a: Vec<Vec<f32>> = net.sizes.iter().map(|&s| vec![0.0; s]).collect();
+    // Tangents along each input: of z[l] and of a[l].
+    let mut tz: Vec<Vec<Vec<f32>>> = (0..inputs)
+        .map(|_| net.sizes[1..].iter().map(|&s| vec![0.0; s]).collect())
+        .collect();
+    let mut ta: Vec<Vec<Vec<f32>>> = (0..inputs)
+        .map(|_| net.sizes.iter().map(|&s| vec![0.0; s]).collect())
+        .collect();
+    // Adjoints of z[l] and of each tangent of z[l].
+    let mut gz: Vec<Vec<f32>> = net.sizes[1..].iter().map(|&s| vec![0.0; s]).collect();
+    let mut gtz: Vec<Vec<Vec<f32>>> = (0..inputs)
+        .map(|_| net.sizes[1..].iter().map(|&s| vec![0.0; s]).collect())
+        .collect();
+    let mut ga = vec![0.0f32; *net.sizes.iter().max().unwrap()];
+    let mut gta = vec![vec![0.0f32; ga.len()]; inputs];
+    let (mut value_loss, mut slope_loss) = (0.0f64, 0.0f64);
+    for &r in rows {
+        net.forward(&x[r * inputs..(r + 1) * inputs], &mut z, &mut a);
+        for j in 0..inputs {
+            ta[j][0].iter_mut().enumerate().for_each(|(q, t)| *t = f32::from(u8::from(q == j)));
+            for l in 0..=last {
+                let (i, o) = (net.sizes[l], net.sizes[l + 1]);
+                for k in 0..o {
+                    let row = &net.w[l][k * i..(k + 1) * i];
+                    let s: f32 = row.iter().zip(&ta[j][l]).map(|(w, t)| w * t).sum();
+                    tz[j][l][k] = s;
+                    if l < last {
+                        ta[j][l + 1][k] = activation_slope(z[l][k]) * s;
+                    }
+                }
+            }
+        }
+        let target = &y[r * outputs..(r + 1) * outputs];
+        let want = &slopes[r * outputs * inputs..(r + 1) * outputs * inputs];
+        for c in 0..outputs {
+            let e = a[last + 1][c] - target[c];
+            value_loss += f64::from(e * e);
+            gz[last][c] = 2.0 * e * scale;
+            for j in 0..inputs {
+                let t = want[c * inputs + j];
+                let w = slope_weight / (1.0 + t * t);
+                let e = tz[j][last][c] - t;
+                slope_loss += f64::from(w * e * e);
+                gtz[j][last][c] = 2.0 * w * e * scale;
+            }
+        }
+        for l in (0..=last).rev() {
+            let (i, o) = (net.sizes[l], net.sizes[l + 1]);
+            for k in 0..o {
+                let d = gz[l][k];
+                grads.b[l][k] += d;
+                let g = &mut grads.w[l][k * i..(k + 1) * i];
+                for (q, g) in g.iter_mut().enumerate() {
+                    let mut s = d * a[l][q];
+                    for j in 0..inputs {
+                        s += gtz[j][l][k] * ta[j][l][q];
+                    }
+                    *g += s;
+                }
+            }
+            if l > 0 {
+                for q in 0..i {
+                    let mut s = 0.0;
+                    for k in 0..o {
+                        s += net.w[l][k * i + q] * gz[l][k];
+                    }
+                    ga[q] = s;
+                    for j in 0..inputs {
+                        let mut s = 0.0;
+                        for k in 0..o {
+                            s += net.w[l][k * i + q] * gtz[j][l][k];
+                        }
+                        gta[j][q] = s;
+                    }
+                }
+                let (before, _) = gz.split_at_mut(l);
+                for q in 0..i {
+                    let zz = z[l - 1][q];
+                    let slope = activation_slope(zz);
+                    let curve = activation_curve(zz);
+                    let mut s = slope * ga[q];
+                    for j in 0..inputs {
+                        s += curve * tz[j][l - 1][q] * gta[j][q];
+                        gtz[j][l - 1][q] = slope * gta[j][q];
+                    }
+                    before[l - 1][q] = s;
+                }
+            }
+        }
+    }
+    (value_loss, slope_loss, grads)
+}
+
 pub(crate) struct Adam {
     pub(crate) m: Grads,
     pub(crate) v: Grads,
@@ -902,4 +1027,95 @@ fn eval(args: EvalArgs) -> CmdResult {
     }
     println!("\nworst surrogate ESR: {worst:.1} dB (0 dB is as large as the signal)");
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The loss of one row, slopes included, in f64 by finite differences
+    /// of the network's own forward pass.
+    fn loss(net: &Net, x: &[f32], y: &[f32], slopes: &[f32], weight: f32) -> f64 {
+        let n = net.sizes[0];
+        let m = *net.sizes.last().unwrap();
+        let mut z: Vec<Vec<f32>> = net.sizes[1..].iter().map(|&s| vec![0.0; s]).collect();
+        let mut a: Vec<Vec<f32>> = net.sizes.iter().map(|&s| vec![0.0; s]).collect();
+        net.forward(x, &mut z, &mut a);
+        let out = a.last().unwrap().clone();
+        let mut total = 0.0f64;
+        for c in 0..m {
+            total += f64::from((out[c] - y[c]).powi(2));
+        }
+        let h = 1e-2f32;
+        for j in 0..n {
+            let mut up = x.to_vec();
+            let mut down = x.to_vec();
+            up[j] += h;
+            down[j] -= h;
+            net.forward(&up, &mut z, &mut a);
+            let hi = a.last().unwrap().clone();
+            net.forward(&down, &mut z, &mut a);
+            let lo = a.last().unwrap().clone();
+            for c in 0..m {
+                let slope = (hi[c] - lo[c]) / (2.0 * h);
+                let t = slopes[c * n + j];
+                total += f64::from(weight / (1.0 + t * t) * (slope - t).powi(2));
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn the_sobolev_gradient_is_the_slope_of_its_loss() {
+        let mut rng = Rng(7);
+        let mut net = Net::new(vec![3, 5, 4, 3], &mut rng);
+        // Biases away from zero, so that every term of the activation counts.
+        for b in &mut net.b {
+            b.iter_mut().for_each(|b| *b = rng.between(-0.8, 0.8) as f32);
+        }
+        let x = [0.3f32, -0.7, 0.5];
+        let y = [0.1f32, -0.4, 0.9];
+        let slopes = [0.5f32, -1.0, 0.2, 3.0, 0.0, -0.3, 0.7, 0.1, -2.0];
+        let weight = 0.8;
+        let (v, s, g) = sobolev_gradient(&net, &x, &y, &slopes, weight, &[0], 1.0);
+        let analytic = loss(&net, &x, &y, &slopes, weight);
+        // The value is the same loss (its slopes exact, not differenced).
+        assert!((v + s - analytic).abs() < 1e-3 * analytic.max(1.0), "{} {}", v + s, analytic);
+        let h = 1e-3f32;
+        let mut worst = 0.0f64;
+        for l in 0..net.layers() {
+            for q in 0..net.w[l].len() {
+                let keep = net.w[l][q];
+                net.w[l][q] = keep + h;
+                let up = sobolev_gradient(&net, &x, &y, &slopes, weight, &[0], 1.0);
+                net.w[l][q] = keep - h;
+                let down = sobolev_gradient(&net, &x, &y, &slopes, weight, &[0], 1.0);
+                net.w[l][q] = keep;
+                let numeric = (up.0 + up.1 - down.0 - down.1) / (2.0 * f64::from(h));
+                let e = (numeric - f64::from(g.w[l][q])).abs() / numeric.abs().max(0.05);
+                worst = worst.max(e);
+            }
+            for q in 0..net.b[l].len() {
+                let keep = net.b[l][q];
+                net.b[l][q] = keep + h;
+                let up = sobolev_gradient(&net, &x, &y, &slopes, weight, &[0], 1.0);
+                net.b[l][q] = keep - h;
+                let down = sobolev_gradient(&net, &x, &y, &slopes, weight, &[0], 1.0);
+                net.b[l][q] = keep;
+                let numeric = (up.0 + up.1 - down.0 - down.1) / (2.0 * f64::from(h));
+                let e = (numeric - f64::from(g.b[l][q])).abs() / numeric.abs().max(0.05);
+                worst = worst.max(e);
+            }
+        }
+        assert!(worst < 2e-2, "worst relative error of the gradient {worst}");
+    }
+
+    #[test]
+    fn the_activations_curve_is_the_slope_of_its_slope() {
+        for x in [-2.9f32, -1.5, -0.2, 0.0, 0.4, 1.1, 2.7] {
+            let h = 1e-3;
+            let numeric = (activation_slope(x + h) - activation_slope(x - h)) / (2.0 * h);
+            assert!((numeric - activation_curve(x)).abs() < 2e-3, "{x}: {numeric} {}", activation_curve(x));
+        }
+    }
 }
