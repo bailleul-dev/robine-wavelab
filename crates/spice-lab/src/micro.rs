@@ -175,11 +175,25 @@ fn trajectory(
     let controls = processor.controls().len();
     let mut seen = 0;
     while seen < samples {
-        for c in 0..controls {
-            let v = if rng.uniform() < 0.15 {
-                f64::from(u8::from(rng.uniform() < 0.5))
+        // Three times in ten, every control at one level together, most
+        // often near the top: drawn one by one, the controls are almost
+        // never all up at once, and a player turns everything up. An AC30's
+        // second stages, never shown that corner, were 70 % off in it.
+        let together = (rng.uniform() < 0.3).then(|| {
+            let r = rng.uniform();
+            if r < 0.6 {
+                rng.between(0.8, 1.0)
+            } else if r < 0.8 {
+                rng.between(0.0, 0.2)
             } else {
                 rng.uniform()
+            }
+        });
+        for c in 0..controls {
+            let v = match together {
+                Some(level) => level,
+                None if rng.uniform() < 0.15 => f64::from(u8::from(rng.uniform() < 0.5)),
+                None => rng.uniform(),
             };
             processor.set_control(c, v);
         }
