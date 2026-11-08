@@ -32,6 +32,12 @@ enum NnCommand {
     Train(TrainArgs),
     /// Run a network in the loop against Newton, in the hard regimes.
     Eval(EvalArgs),
+    /// List a circuit's devices, the numbers `micro-train` takes.
+    MicroList(crate::micro::MicroListArgs),
+    /// Learn the law of each chosen component with a small network.
+    MicroTrain(crate::micro::MicroTrainArgs),
+    /// Run the circuit with those networks in the loop against the analytic laws.
+    MicroEval(crate::micro::MicroEvalArgs),
 }
 
 #[derive(Args)]
@@ -101,6 +107,9 @@ pub fn nn(args: NnArgs) -> CmdResult {
     match args.command {
         NnCommand::Train(a) => train(a),
         NnCommand::Eval(a) => eval(a),
+        NnCommand::MicroList(a) => crate::micro::list(a),
+        NnCommand::MicroTrain(a) => crate::micro::train(a),
+        NnCommand::MicroEval(a) => crate::micro::eval(a),
     }
 }
 
@@ -108,10 +117,10 @@ pub fn nn(args: NnArgs) -> CmdResult {
 
 /// SplitMix64: small, and the same everywhere.
 #[derive(Clone)]
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -119,10 +128,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     /// Uniform in `[0, 1)`.
-    fn uniform(&mut self) -> f64 {
+    pub(crate) fn uniform(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
-    fn between(&mut self, low: f64, high: f64) -> f64 {
+    pub(crate) fn between(&mut self, low: f64, high: f64) -> f64 {
         low + (high - low) * self.uniform()
     }
     /// Log-uniform between two positive numbers.
@@ -139,7 +148,7 @@ impl Rng {
 
 /// What is played.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Sine,
     Pluck,
     Chord,
@@ -158,7 +167,7 @@ const KINDS: [(Kind, f64); 6] = [
     (Kind::Silence, 0.07),
 ];
 
-fn pick(rng: &mut Rng) -> Kind {
+pub(crate) fn pick(rng: &mut Rng) -> Kind {
     let mut x = rng.uniform();
     for (kind, share) in KINDS {
         if x < share {
@@ -188,7 +197,13 @@ fn pluck(out: &mut [f32], rate: f64, f0: f64, peak: f64, decay: f64, bright: f64
 }
 
 /// `seconds` of a kind of excitation, `volts` being the largest peak.
-fn excitation(kind: Kind, rng: &mut Rng, rate: f64, seconds: f64, volts: f64) -> Vec<f32> {
+pub(crate) fn excitation(
+    kind: Kind,
+    rng: &mut Rng,
+    rate: f64,
+    seconds: f64,
+    volts: f64,
+) -> Vec<f32> {
     let n = (seconds * rate) as usize;
     let mut out = vec![0.0f32; n];
     match kind {
@@ -336,15 +351,15 @@ fn record(
 
 // -------------------------------------------------------------- training
 
-struct Net {
-    sizes: Vec<usize>,
+pub(crate) struct Net {
+    pub(crate) sizes: Vec<usize>,
     /// Per layer, `out x in` row-major.
-    w: Vec<Vec<f32>>,
-    b: Vec<Vec<f32>>,
+    pub(crate) w: Vec<Vec<f32>>,
+    pub(crate) b: Vec<Vec<f32>>,
 }
 
 impl Net {
-    fn new(sizes: Vec<usize>, rng: &mut Rng) -> Net {
+    pub(crate) fn new(sizes: Vec<usize>, rng: &mut Rng) -> Net {
         let mut w = Vec::new();
         let mut b = Vec::new();
         for pair in sizes.windows(2) {
@@ -360,7 +375,7 @@ impl Net {
         Net { sizes, w, b }
     }
 
-    fn layers(&self) -> usize {
+    pub(crate) fn layers(&self) -> usize {
         self.w.len()
     }
 
@@ -386,19 +401,19 @@ impl Net {
     }
 }
 
-struct Grads {
+pub(crate) struct Grads {
     w: Vec<Vec<f32>>,
     b: Vec<Vec<f32>>,
 }
 
 impl Grads {
-    fn zeros(net: &Net) -> Grads {
+    pub(crate) fn zeros(net: &Net) -> Grads {
         Grads {
             w: net.w.iter().map(|w| vec![0.0; w.len()]).collect(),
             b: net.b.iter().map(|b| vec![0.0; b.len()]).collect(),
         }
     }
-    fn add(&mut self, other: &Grads) {
+    pub(crate) fn add(&mut self, other: &Grads) {
         for (a, b) in self
             .w
             .iter_mut()
@@ -413,7 +428,13 @@ impl Grads {
 }
 
 /// Loss and gradient over rows `from..to` of the normalised data.
-fn gradient(net: &Net, x: &[f32], y: &[f32], rows: &[usize], scale: f32) -> (f64, Grads) {
+pub(crate) fn gradient(
+    net: &Net,
+    x: &[f32],
+    y: &[f32],
+    rows: &[usize],
+    scale: f32,
+) -> (f64, Grads) {
     let inputs = net.sizes[0];
     let outputs = *net.sizes.last().unwrap();
     let mut grads = Grads::zeros(net);
@@ -455,14 +476,14 @@ fn gradient(net: &Net, x: &[f32], y: &[f32], rows: &[usize], scale: f32) -> (f64
     (loss, grads)
 }
 
-struct Adam {
-    m: Grads,
-    v: Grads,
-    step: i32,
+pub(crate) struct Adam {
+    pub(crate) m: Grads,
+    pub(crate) v: Grads,
+    pub(crate) step: i32,
 }
 
 impl Adam {
-    fn update(&mut self, net: &mut Net, g: &Grads, rate: f32) {
+    pub(crate) fn update(&mut self, net: &mut Net, g: &Grads, rate: f32) {
         self.step += 1;
         let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
         let c1 = 1.0 - b1.powi(self.step);
@@ -481,7 +502,7 @@ impl Adam {
     }
 }
 
-fn threads(wanted: Option<usize>) -> usize {
+pub(crate) fn threads(wanted: Option<usize>) -> usize {
     wanted.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -737,12 +758,12 @@ fn train(args: TrainArgs) -> CmdResult {
 
 // ------------------------------------------------------------------ eval
 
-fn db(ratio: f64) -> f64 {
+pub(crate) fn db(ratio: f64) -> f64 {
     10.0 * ratio.max(1e-300).log10()
 }
 
 /// Error-to-signal of the AC part, in dB.
-fn esr(reference: &[f32], other: &[f32]) -> f64 {
+pub(crate) fn esr(reference: &[f32], other: &[f32]) -> f64 {
     let mean = reference.iter().map(|&v| f64::from(v)).sum::<f64>() / reference.len() as f64;
     let (mut err, mut sig) = (0.0, 0.0);
     for (a, b) in reference.iter().zip(other) {

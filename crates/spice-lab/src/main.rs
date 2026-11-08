@@ -2,6 +2,7 @@ mod alias;
 mod commands;
 mod dk;
 mod grade;
+mod micro;
 mod model;
 mod ngspice;
 mod nn;
