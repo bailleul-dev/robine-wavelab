@@ -18,7 +18,9 @@
 //! analytic laws, in the regimes where the circuit is worth simulating.
 
 use crate::commands::{build, load_with, positions, CmdResult};
-use crate::nn::{db, esr, excitation, gradient, pick, threads, Adam, Grads, Kind, Net, Rng};
+use crate::nn::{
+    db, esr, excitation, pick, threads, weighted_gradient, Adam, Grads, Kind, Net, Rng,
+};
 use clap::Args;
 use robine_spice::{write_set, MicroNet, Processor, MAX_WIDTH};
 use std::path::PathBuf;
@@ -47,6 +49,22 @@ pub struct MicroTrainArgs {
     /// range becomes the network's box.
     #[arg(long)]
     data: Option<PathBuf>,
+    /// Weigh each error by the volts it makes at the circuit's nonlinear
+    /// ports (the current times what the circuit's linear network turns it
+    /// into), counting this many volts as much as a relative error of one
+    /// standard deviation: a grid fed through a megohm cares about a
+    /// nanoampere, a plate on a transformer does not. 0 for a plain
+    /// relative error.
+    /// Off by default: measured on the AC30's output pentodes, it did not
+    /// help.
+    #[arg(long, default_value_t = 0.0)]
+    volts_weight: f64,
+    /// The scale a current is learnt in (its logarithm above that):
+    /// `median`, the median of all its values (a current that is mostly
+    /// zero, as a grid's, is then learnt on a scale of nothing, every
+    /// femtoampere told apart), or `flowing`, the median of where it flows.
+    #[arg(long, default_value = "median")]
+    current_scale: String,
     /// Sizes of the hidden layers, comma separated (at most 16 wide).
     #[arg(long, value_delimiter = ',', default_value = "16,16")]
     hidden: Vec<usize>,
@@ -97,6 +115,15 @@ pub struct MicroEvalArgs {
     /// Largest volts at the circuit input.
     #[arg(long, default_value_t = 2.0)]
     volts: f64,
+    /// Only the networks of these devices; every one in the set when not
+    /// given (to find which one an error comes from).
+    #[arg(long, value_delimiter = ',')]
+    devices: Vec<usize>,
+    /// Instead of the networks, judge this other netlist (the same circuit
+    /// with a part changed) with its own laws: what a dB of the table is
+    /// worth in component tolerances.
+    #[arg(long)]
+    against: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -149,7 +176,33 @@ fn trajectory(
             processor.set_control(c, v);
         }
         let seconds = rng.between(0.4, 2.0);
-        let signal = excitation(pick(&mut rng), &mut rng, rate, seconds, volts);
+        // A third of the time, the hard things the circuit is worth
+        // simulating for, at full level: the random levels of the other
+        // excitations are spread over decades and rarely reach it, and a
+        // network never shown where the clamps conduct and the output
+        // stage is driven past cutoff cannot know it.
+        let signal = if rng.uniform() < 1.0 / 3.0 {
+            let peak = volts * rng.between(0.7, 1.0);
+            if rng.uniform() < 0.5 {
+                let f = rng.log_between(1000.0, 6000.0);
+                (0..(seconds * rate) as usize)
+                    .map(|i| (peak * (std::f64::consts::TAU * f * i as f64 / rate).sin()) as f32)
+                    .collect()
+            } else {
+                let kind = if rng.uniform() < 0.5 {
+                    Kind::Burst
+                } else {
+                    Kind::Chord
+                };
+                let mut s = excitation(kind, &mut rng, rate, seconds, volts);
+                let top = s.iter().fold(0.0f32, |t, v| t.max(v.abs())).max(1e-9);
+                let gain = (peak / f64::from(top)) as f32;
+                s.iter_mut().for_each(|v| *v *= gain);
+                s
+            }
+        } else {
+            excitation(pick(&mut rng), &mut rng, rate, seconds, volts)
+        };
         for &x in &signal {
             processor.process_sample(x);
             for (slot, &k) in out.iter_mut().zip(devices) {
@@ -165,6 +218,33 @@ fn trajectory(
         }
     }
     out
+}
+
+/// For each nonlinear port, the volts an ampere through it makes at the
+/// nonlinear ports, all of them (the norm of its column of `K` in
+/// `v = p + K i`), at the worst of a few settings of the controls.
+fn impedance(template: &Processor) -> Vec<f64> {
+    let m = template.nonlinear_port_count();
+    let mut worst = vec![0.0f64; m];
+    let controls = template.controls().len();
+    for setting in [None, Some(0.0), Some(0.5), Some(1.0)] {
+        let mut p = template.clone();
+        if let Some(v) = setting {
+            for c in 0..controls {
+                p.set_control(c, v);
+            }
+        }
+        let system = p.linear_system();
+        let width = system.drive + m;
+        for c in 0..m {
+            let norm = (0..m)
+                .map(|r| system.matrix[r * width + system.drive + c].powi(2))
+                .sum::<f64>()
+                .sqrt();
+            worst[c] = worst[c].max(norm);
+        }
+    }
+    worst
 }
 
 /// Rows of `ports` voltages, and the currents the targets give there.
@@ -264,6 +344,7 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
         began.elapsed().as_secs_f64()
     );
 
+    let impedance = impedance(&template);
     let mut nets = Vec::new();
     for (n, &k) in devices.iter().enumerate() {
         let ports = template.device_ports(k);
@@ -274,7 +355,9 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
             visited.extend_from_slice(&part[n]);
         }
         // ---- the table to learn: law or measurements
-        let (table, low, high) = if let Some(path) = &args.data {
+        // `along`: the rows before it are where the circuit went (or were
+        // measured), those after it fill the rest of the box.
+        let (table, low, high, along) = if let Some(path) = &args.data {
             let t = read_csv(path, ports)?;
             let (mut low, mut high) = (vec![f64::MAX; ports], vec![f64::MIN; ports]);
             for row in t.v.chunks_exact(ports) {
@@ -283,7 +366,8 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                     high[c] = high[c].max(row[c]);
                 }
             }
-            (t, low, high)
+            let along = t.v.len() / ports;
+            (t, low, high, along)
         } else {
             let (mut low, mut high) = (vec![f64::MAX; ports], vec![f64::MIN; ports]);
             for row in visited.chunks_exact(ports) {
@@ -317,11 +401,15 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                 template.device_law(k, row, &mut i);
                 t.i.extend_from_slice(&i);
             }
-            (t, low, high)
+            (t, low, high, half)
         };
         let rows = table.v.len() / ports;
         println!(
-            "device {k} ({kind}, {ports} port(s)): {rows} rows, box {}",
+            "device {k} ({kind}, {ports} port(s)): {rows} rows, {} ohm seen, box {}",
+            (0..ports)
+                .map(|c| format!("{:.2e}", impedance[template.device_first_port(k) + c]))
+                .collect::<Vec<_>>()
+                .join("/"),
             (0..ports)
                 .map(|c| format!("[{:.3}, {:.3}]", low[c], high[c]))
                 .collect::<Vec<_>>()
@@ -351,9 +439,30 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                 .skip(c)
                 .step_by(ports)
                 .map(|v| v.abs())
+                .filter(|v| *v > 0.0)
                 .collect();
             magnitudes.sort_by(f64::total_cmp);
-            *s = (magnitudes[magnitudes.len() / 2] as f32).max(1e-18);
+            // The level a current sits at when it flows: the median of
+            // where it is not zero (a grid draws nothing most of the time,
+            // and a scale of nothing would have the network learn fifteen
+            // decades), but no less than a ten-thousandth of its largest.
+            let largest = magnitudes.last().copied().unwrap_or(0.0);
+            let median = magnitudes.get(magnitudes.len() / 2).copied().unwrap_or(0.0);
+            *s = if args.current_scale == "flowing" {
+                (median.max(1e-4 * largest) as f32).max(1e-18)
+            } else {
+                // Over all the rows, zeros counted.
+                let flowing = magnitudes.len();
+                let all = rows;
+                let zeros = all - flowing;
+                let middle = all / 2;
+                let m = if middle < zeros {
+                    0.0
+                } else {
+                    magnitudes[middle - zeros]
+                };
+                (m as f32).max(1e-18)
+            };
         }
         let xn: Vec<f32> = table
             .v
@@ -399,6 +508,35 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
             }
         }
 
+        // ---- what an error costs in volts, per row and port
+        let at = template.device_first_port(k);
+        let weights: Option<Vec<f32>> = (args.volts_weight > 0.0).then(|| {
+            let mut w = vec![0.0f32; rows * ports];
+            for (r, row) in table.i.chunks_exact(ports).enumerate() {
+                for c in 0..ports {
+                    let y = (row[c] / f64::from(output_scale[c])).asinh();
+                    // d i / d y, per standardised unit of y.
+                    let amps = f64::from(output_scale[c]) * y.cosh() * f64::from(y_scale[c]);
+                    let volts = impedance[at + c] * amps / args.volts_weight;
+                    w[r * ports + c] = (1.0 + (volts * volts).min(1e8)) as f32;
+                }
+            }
+            for c in 0..ports {
+                let mean = w
+                    .iter()
+                    .skip(c)
+                    .step_by(ports)
+                    .map(|&v| f64::from(v))
+                    .sum::<f64>()
+                    / rows as f64;
+                for v in w.iter_mut().skip(c).step_by(ports) {
+                    *v = (f64::from(*v) / mean) as f32;
+                }
+            }
+            w
+        });
+        let weights = weights.as_deref();
+
         // ---- learn
         let mut sizes = vec![ports];
         sizes.extend(&args.hidden);
@@ -409,9 +547,15 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
             v: Grads::zeros(&net),
             step: 0,
         };
-        let held = rows / 10;
-        let mut order: Vec<usize> = (0..rows - held).collect();
-        let held_rows: Vec<usize> = (rows - held..rows).collect();
+        // A tenth of the rows, drawn at random from both halves, are kept
+        // back to judge it on.
+        let mut all: Vec<usize> = (0..rows).collect();
+        for q in (1..rows).rev() {
+            let j = (rng.next() % (q as u64 + 1)) as usize;
+            all.swap(q, j);
+        }
+        let held_rows: Vec<usize> = all[..rows / 10].to_vec();
+        let mut order: Vec<usize> = all[rows / 10..].to_vec();
         let steps_per_epoch = (order.len() / args.batch).max(1);
         let total = (steps_per_epoch * args.epochs) as f32;
         let mut done = 0f32;
@@ -431,7 +575,8 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                         .chunks(chunk)
                         .map(|part| {
                             let (net, xn, ys) = (&net, &xn, &ys);
-                            scope.spawn(move || gradient(net, xn, ys, part, scale))
+                            scope
+                                .spawn(move || weighted_gradient(net, xn, ys, weights, part, scale))
                         })
                         .collect();
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -448,7 +593,7 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                 done += 1.0;
             }
             if epoch + 1 == args.epochs || (epoch + 1) % 10 == 0 {
-                let (held_loss, _) = gradient(&net, &xn, &ys, &held_rows, 0.0);
+                let (held_loss, _) = weighted_gradient(&net, &xn, &ys, weights, &held_rows, 0.0);
                 last = (
                     loss / (steps_per_epoch * args.batch * ports) as f64,
                     held_loss / (held_rows.len() * ports) as f64,
@@ -492,7 +637,6 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
         .map_err(|e| e.to_string())?;
 
         // ---- how far it is from the target on the points held back
-        let mut errors: Vec<f64> = Vec::new();
         let biggest: Vec<f64> = (0..ports)
             .map(|c| {
                 table
@@ -503,21 +647,38 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
                     .fold(0.0f64, |m, v| m.max(v.abs()))
             })
             .collect();
+        // Per port, on the trajectory and over the rest of the box apart.
+        let mut errors: Vec<Vec<f64>> = vec![Vec::new(); 2 * ports];
         let mut got = vec![0.0; ports];
         let mut j = [0.0; 9];
-        for r in rows - held..rows {
+        for &r in &held_rows {
             micro.eval(&table.v[r * ports..(r + 1) * ports], &mut got, &mut j);
+            let group = usize::from(r >= along);
             for c in 0..ports {
                 let want = table.i[r * ports + c];
-                errors.push((got[c] - want).abs() / (want.abs() + 0.01 * biggest[c]).max(1e-30));
+                errors[group * ports + c]
+                    .push((got[c] - want).abs() / (want.abs() + 0.01 * biggest[c]).max(1e-30));
             }
         }
-        errors.sort_by(f64::total_cmp);
-        let at = |q: f64| errors[((errors.len() - 1) as f64 * q) as usize];
-        println!(
-            "  error against the target, relative to the current or 1% of its largest: median {:.2e}, 99% {:.2e}, worst {:.2e}",
-            at(0.5), at(0.99), at(1.0)
-        );
+        println!("  error against the target, relative to the current or 1% of its largest (median / 99% / worst):");
+        for (g, name) in ["along the circuit", "rest of the box"].iter().enumerate() {
+            let mut line = format!("    {name:18}");
+            for c in 0..ports {
+                let e = &mut errors[g * ports + c];
+                if e.is_empty() {
+                    continue;
+                }
+                e.sort_by(f64::total_cmp);
+                let at = |q: f64| e[((e.len() - 1) as f64 * q) as usize];
+                line += &format!(
+                    "  port {c}: {:.1e} / {:.1e} / {:.1e}",
+                    at(0.5),
+                    at(0.99),
+                    at(1.0)
+                );
+            }
+            println!("{line}");
+        }
         nets.push(micro);
     }
     std::fs::write(&args.output, write_set(&nets))
@@ -563,6 +724,9 @@ pub fn eval(args: MicroEvalArgs) -> CmdResult {
     let mut replaced = Vec::new();
     for net in nets {
         let k = device_of(&net).ok_or("a network's signature has no `#device`")?;
+        if !args.devices.is_empty() && !args.devices.contains(&k) {
+            continue;
+        }
         multiply_adds += net.multiply_adds();
         base.set_micro(k, net).map_err(|e| e.to_string())?;
         replaced.push(k);
@@ -575,6 +739,13 @@ pub fn eval(args: MicroEvalArgs) -> CmdResult {
     let shaping: Vec<usize> = (0..base.controls().len())
         .filter(|&i| base.control_shapes_nonlinear_solve(i))
         .collect();
+    let other = match &args.against {
+        Some(path) => {
+            let c = load_with(path, &args.source)?;
+            Some(build(&c, args.sample_rate, &positions(&c, &[])?)?)
+        }
+        None => None,
+    };
     let rate = args.sample_rate;
     let scenarios: [(&str, Kind, f64); 6] = [
         ("soft pluck", Kind::Pluck, 0.08),
@@ -606,7 +777,10 @@ pub fn eval(args: MicroEvalArgs) -> CmdResult {
                 }
             }
             let (reference, ns_e, it_e, f_e, _) = run(&base, false, &setting, &input);
-            let (nets_out, ns_n, it_n, f_n, outside) = run(&base, true, &setting, &input);
+            let (nets_out, ns_n, it_n, f_n, outside) = match &other {
+                Some(other) => run(other, false, &setting, &input),
+                None => run(&base, true, &setting, &input),
+            };
             let peak = reference
                 .iter()
                 .fold(0.0f32, |m, v| m.max(v.abs()))

@@ -135,7 +135,7 @@ impl Rng {
         low + (high - low) * self.uniform()
     }
     /// Log-uniform between two positive numbers.
-    fn log_between(&mut self, low: f64, high: f64) -> f64 {
+    pub(crate) fn log_between(&mut self, low: f64, high: f64) -> f64 {
         (low.ln() + (high.ln() - low.ln()) * self.uniform()).exp()
     }
     fn gauss(&mut self) -> f64 {
@@ -435,6 +435,19 @@ pub(crate) fn gradient(
     rows: &[usize],
     scale: f32,
 ) -> (f64, Grads) {
+    weighted_gradient(net, x, y, None, rows, scale)
+}
+
+/// The same, each output of each row weighing as `weights` says (laid out
+/// like `y`).
+pub(crate) fn weighted_gradient(
+    net: &Net,
+    x: &[f32],
+    y: &[f32],
+    weights: Option<&[f32]>,
+    rows: &[usize],
+    scale: f32,
+) -> (f64, Grads) {
     let inputs = net.sizes[0];
     let outputs = *net.sizes.last().unwrap();
     let mut grads = Grads::zeros(net);
@@ -448,8 +461,9 @@ pub(crate) fn gradient(
         let target = &y[r * outputs..(r + 1) * outputs];
         for k in 0..outputs {
             let e = a[last + 1][k] - target[k];
-            loss += f64::from(e * e);
-            delta[last][k] = 2.0 * e * scale;
+            let weight = weights.map_or(1.0, |w| w[r * outputs + k]);
+            loss += f64::from(weight * e * e);
+            delta[last][k] = 2.0 * weight * e * scale;
         }
         for l in (0..=last).rev() {
             let (i, o) = (net.sizes[l], net.sizes[l + 1]);
