@@ -65,9 +65,17 @@ pub struct MicroTrainArgs {
     /// femtoampere told apart), or `flowing`, the median of where it flows.
     #[arg(long, default_value = "median")]
     current_scale: String,
-    /// Sizes of the hidden layers, comma separated (at most 16 wide).
-    #[arg(long, value_delimiter = ',', default_value = "16,16")]
+    /// Sizes of the hidden layers, comma separated (at most 32 wide). When
+    /// not given, each device gets the narrowest of a ladder of two-layer
+    /// sizes that is within `--size-slack` of the best of them.
+    #[arg(long, value_delimiter = ',')]
     hidden: Vec<usize>,
+    /// How much worse than the best size a narrower network may be, at the
+    /// 99th percentile of its worst port along the circuit, and be kept.
+    /// 1 keeps the best: a device's error looks small alone and adds up in
+    /// the circuit (the AC30 sized at 2 went from -31 to -24 dB at worst).
+    #[arg(long, default_value_t = 1.0)]
+    size_slack: f64,
     /// Samples of the circuit played to find where its devices work.
     #[arg(long, default_value_t = 600_000)]
     samples: usize,
@@ -297,7 +305,7 @@ fn read_csv(path: &PathBuf, ports: usize) -> Result<Table, String> {
 pub fn train(args: MicroTrainArgs) -> CmdResult {
     let circuit = load_with(&args.circuit, &args.source)?;
     let template = build(&circuit, args.sample_rate, &positions(&circuit, &[])?)?;
-    if args.hidden.is_empty() || args.hidden.iter().any(|&h| h == 0 || h > MAX_WIDTH) {
+    if args.hidden.iter().any(|&h| h == 0 || h > MAX_WIDTH) {
         return Err(format!("hidden layers are 1 to {MAX_WIDTH} wide").into());
     }
     let mut devices: Vec<usize> = if args.devices.is_empty() {
@@ -320,7 +328,7 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
     let threads = threads(args.threads);
     let began = Instant::now();
     println!(
-        "{}: learning {} device(s), hidden {:?}",
+        "{}: learning {} device(s), hidden {:?} (empty: sized per device)",
         args.circuit.display(),
         devices.len(),
         args.hidden
@@ -537,16 +545,6 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
         });
         let weights = weights.as_deref();
 
-        // ---- learn
-        let mut sizes = vec![ports];
-        sizes.extend(&args.hidden);
-        sizes.push(ports);
-        let mut net = Net::new(sizes.clone(), &mut rng);
-        let mut adam = Adam {
-            m: Grads::zeros(&net),
-            v: Grads::zeros(&net),
-            step: 0,
-        };
         // A tenth of the rows, drawn at random from both halves, are kept
         // back to judge it on.
         let mut all: Vec<usize> = (0..rows).collect();
@@ -555,130 +553,168 @@ pub fn train(args: MicroTrainArgs) -> CmdResult {
             all.swap(q, j);
         }
         let held_rows: Vec<usize> = all[..rows / 10].to_vec();
-        let mut order: Vec<usize> = all[rows / 10..].to_vec();
-        let steps_per_epoch = (order.len() / args.batch).max(1);
-        let total = (steps_per_epoch * args.epochs) as f32;
-        let mut done = 0f32;
-        let mut last = (0.0, 0.0);
-        for epoch in 0..args.epochs {
-            for q in (1..order.len()).rev() {
-                let j = (rng.next() % (q as u64 + 1)) as usize;
-                order.swap(q, j);
-            }
-            let mut loss = 0.0;
-            for step in 0..steps_per_epoch {
-                let batch = &order[step * args.batch..((step + 1) * args.batch).min(order.len())];
-                let chunk = batch.len().div_ceil(threads);
-                let scale = 1.0 / (batch.len() * ports) as f32;
-                let results: Vec<(f64, Grads)> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = batch
-                        .chunks(chunk)
-                        .map(|part| {
-                            let (net, xn, ys) = (&net, &xn, &ys);
-                            scope
-                                .spawn(move || weighted_gradient(net, xn, ys, weights, part, scale))
-                        })
-                        .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                let mut sum = Grads::zeros(&net);
-                for (l, g) in &results {
-                    loss += l;
-                    sum.add(g);
+        let training_rows: Vec<usize> = all[rows / 10..].to_vec();
+        // The sizes tried, widest first. A fixed `--hidden` is the only
+        // one tried.
+        let ladder: Vec<Vec<usize>> = if args.hidden.is_empty() {
+            [32, 24, 16, 12, 8, 6, 4].iter().map(|&w| vec![w, w]).collect()
+        } else {
+            vec![args.hidden.clone()]
+        };
+        let mut tried: Vec<(f64, MicroNet, Vec<usize>)> = Vec::new();
+        for hidden in &ladder {
+            // ---- learn
+            let mut sizes = vec![ports];
+            sizes.extend(hidden);
+            sizes.push(ports);
+            let mut net = Net::new(sizes.clone(), &mut rng);
+            let mut adam = Adam {
+                m: Grads::zeros(&net),
+                v: Grads::zeros(&net),
+                step: 0,
+            };
+            let mut order = training_rows.clone();
+            let steps_per_epoch = (order.len() / args.batch).max(1);
+            let total = (steps_per_epoch * args.epochs) as f32;
+            let mut done = 0f32;
+            let mut last = (0.0, 0.0);
+            for epoch in 0..args.epochs {
+                for q in (1..order.len()).rev() {
+                    let j = (rng.next() % (q as u64 + 1)) as usize;
+                    order.swap(q, j);
                 }
-                let phase = done / total;
-                let rate =
-                    args.rate * (0.05 + 0.95 * 0.5 * (1.0 + (std::f32::consts::PI * phase).cos()));
-                adam.update(&mut net, &sum, rate);
-                done += 1.0;
-            }
-            if epoch + 1 == args.epochs || (epoch + 1) % 10 == 0 {
-                let (held_loss, _) = weighted_gradient(&net, &xn, &ys, weights, &held_rows, 0.0);
-                last = (
-                    loss / (steps_per_epoch * args.batch * ports) as f64,
-                    held_loss / (held_rows.len() * ports) as f64,
-                );
-                println!(
-                    "  epoch {:3}: loss {:.6} held-out {:.6} ({:.0} s)",
-                    epoch + 1,
-                    last.0,
-                    last.1,
-                    began.elapsed().as_secs_f64()
-                );
-            }
-        }
-        let _ = last;
-
-        // ---- export, the standardising folded into the last layer
-        let mut layers = Vec::new();
-        for l in 0..net.layers() {
-            let (i, o) = (sizes[l], sizes[l + 1]);
-            let mut w = net.w[l].clone();
-            let mut b = net.b[l].clone();
-            if l == net.layers() - 1 {
-                for c in 0..o {
-                    for j in 0..i {
-                        w[c * i + j] *= y_scale[c];
+                let mut loss = 0.0;
+                for step in 0..steps_per_epoch {
+                    let batch = &order[step * args.batch..((step + 1) * args.batch).min(order.len())];
+                    let chunk = batch.len().div_ceil(threads);
+                    let scale = 1.0 / (batch.len() * ports) as f32;
+                    let results: Vec<(f64, Grads)> = std::thread::scope(|scope| {
+                        let handles: Vec<_> = batch
+                            .chunks(chunk)
+                            .map(|part| {
+                                let (net, xn, ys) = (&net, &xn, &ys);
+                                scope
+                                    .spawn(move || weighted_gradient(net, xn, ys, weights, part, scale))
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    let mut sum = Grads::zeros(&net);
+                    for (l, g) in &results {
+                        loss += l;
+                        sum.add(g);
                     }
-                    b[c] = b[c] * y_scale[c] + y_mean[c];
+                    let phase = done / total;
+                    let rate =
+                        args.rate * (0.05 + 0.95 * 0.5 * (1.0 + (std::f32::consts::PI * phase).cos()));
+                    adam.update(&mut net, &sum, rate);
+                    done += 1.0;
+                }
+                if epoch + 1 == args.epochs || (epoch + 1) % 10 == 0 {
+                    let (held_loss, _) = weighted_gradient(&net, &xn, &ys, weights, &held_rows, 0.0);
+                    last = (
+                        loss / (steps_per_epoch * args.batch * ports) as f64,
+                        held_loss / (held_rows.len() * ports) as f64,
+                    );
+                    println!(
+                        "  epoch {:3}: loss {:.6} held-out {:.6} ({:.0} s)",
+                        epoch + 1,
+                        last.0,
+                        last.1,
+                        began.elapsed().as_secs_f64()
+                    );
                 }
             }
-            layers.push((i, o, w, b));
-        }
-        let micro = MicroNet::new(
-            format!("{kind} #{k}"),
-            ports,
-            input_mean,
-            input_scale,
-            output_scale,
-            (low, high),
-            layers,
-        )
-        .map_err(|e| e.to_string())?;
+            let _ = last;
 
-        // ---- how far it is from the target on the points held back
-        let biggest: Vec<f64> = (0..ports)
-            .map(|c| {
-                table
-                    .i
-                    .iter()
-                    .skip(c)
-                    .step_by(ports)
-                    .fold(0.0f64, |m, v| m.max(v.abs()))
-            })
-            .collect();
-        // Per port, on the trajectory and over the rest of the box apart.
-        let mut errors: Vec<Vec<f64>> = vec![Vec::new(); 2 * ports];
-        let mut got = vec![0.0; ports];
-        let mut j = [0.0; 9];
-        for &r in &held_rows {
-            micro.eval(&table.v[r * ports..(r + 1) * ports], &mut got, &mut j);
-            let group = usize::from(r >= along);
-            for c in 0..ports {
-                let want = table.i[r * ports + c];
-                errors[group * ports + c]
-                    .push((got[c] - want).abs() / (want.abs() + 0.01 * biggest[c]).max(1e-30));
-            }
-        }
-        println!("  error against the target, relative to the current or 1% of its largest (median / 99% / worst):");
-        for (g, name) in ["along the circuit", "rest of the box"].iter().enumerate() {
-            let mut line = format!("    {name:18}");
-            for c in 0..ports {
-                let e = &mut errors[g * ports + c];
-                if e.is_empty() {
-                    continue;
+            // ---- export, the standardising folded into the last layer
+            let mut layers = Vec::new();
+            for l in 0..net.layers() {
+                let (i, o) = (sizes[l], sizes[l + 1]);
+                let mut w = net.w[l].clone();
+                let mut b = net.b[l].clone();
+                if l == net.layers() - 1 {
+                    for c in 0..o {
+                        for j in 0..i {
+                            w[c * i + j] *= y_scale[c];
+                        }
+                        b[c] = b[c] * y_scale[c] + y_mean[c];
+                    }
                 }
-                e.sort_by(f64::total_cmp);
-                let at = |q: f64| e[((e.len() - 1) as f64 * q) as usize];
-                line += &format!(
-                    "  port {c}: {:.1e} / {:.1e} / {:.1e}",
-                    at(0.5),
-                    at(0.99),
-                    at(1.0)
-                );
+                layers.push((i, o, w, b));
             }
-            println!("{line}");
+            let micro = MicroNet::new(
+                format!("{kind} #{k}"),
+                ports,
+                input_mean.clone(),
+                input_scale.clone(),
+                output_scale.clone(),
+                (low.clone(), high.clone()),
+                layers,
+            )
+            .map_err(|e| e.to_string())?;
+
+            // ---- how far it is from the target on the points held back
+            let biggest: Vec<f64> = (0..ports)
+                .map(|c| {
+                    table
+                        .i
+                        .iter()
+                        .skip(c)
+                        .step_by(ports)
+                        .fold(0.0f64, |m, v| m.max(v.abs()))
+                })
+                .collect();
+            // Per port, on the trajectory and over the rest of the box apart.
+            let mut errors: Vec<Vec<f64>> = vec![Vec::new(); 2 * ports];
+            let mut got = vec![0.0; ports];
+            let mut j = [0.0; 9];
+            for &r in &held_rows {
+                micro.eval(&table.v[r * ports..(r + 1) * ports], &mut got, &mut j);
+                let group = usize::from(r >= along);
+                for c in 0..ports {
+                    let want = table.i[r * ports + c];
+                    errors[group * ports + c]
+                        .push((got[c] - want).abs() / (want.abs() + 0.01 * biggest[c]).max(1e-30));
+                }
+            }
+            println!("  hidden {hidden:?}, error against the target, relative to the current or 1% of its largest (median / 99% / worst):");
+            for (g, name) in ["along the circuit", "rest of the box"].iter().enumerate() {
+                let mut line = format!("    {name:18}");
+                for c in 0..ports {
+                    let e = &mut errors[g * ports + c];
+                    if e.is_empty() {
+                        continue;
+                    }
+                    e.sort_by(f64::total_cmp);
+                    let at = |q: f64| e[((e.len() - 1) as f64 * q) as usize];
+                    line += &format!(
+                        "  port {c}: {:.1e} / {:.1e} / {:.1e}",
+                        at(0.5),
+                        at(0.99),
+                        at(1.0)
+                    );
+                }
+                println!("{line}");
+            }
+            // What it is judged on: its worst port, at the 99th percentile,
+            // where the circuit goes.
+            let score = (0..ports)
+                .filter_map(|c| {
+                    let e = &errors[c];
+                    (!e.is_empty()).then(|| e[((e.len() - 1) as f64 * 0.99) as usize])
+                })
+                .fold(0.0f64, f64::max);
+            tried.push((score, micro, hidden.clone()));
         }
+        // The narrowest within `size_slack` of the best of them all: one
+        // size against the next is within the noise of training.
+        let best = tried.iter().map(|t| t.0).fold(f64::INFINITY, f64::min);
+        let (_, micro, hidden) = tried
+            .into_iter()
+            .rfind(|t| t.0 <= args.size_slack * best)
+            .expect("the best is within any slack of itself");
+        println!("  kept hidden {hidden:?}, {} multiply-adds", micro.multiply_adds());
         nets.push(micro);
     }
     std::fs::write(&args.output, write_set(&nets))
