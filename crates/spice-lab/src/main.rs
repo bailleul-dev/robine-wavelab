@@ -4,6 +4,7 @@ mod dk;
 mod grade;
 mod model;
 mod ngspice;
+mod nn;
 mod rating;
 
 use clap::{Parser, Subcommand};
@@ -41,6 +42,8 @@ enum Command {
     Grade(grade::GradeArgs),
     /// Export the reduced linear system, optionally with a traced run.
     Dk(dk::DkArgs),
+    /// Train a network to stand in for a circuit's nonlinear solve, and judge it.
+    Nn(nn::NnArgs),
 }
 
 fn main() -> ExitCode {
@@ -60,6 +63,7 @@ fn main() -> ExitCode {
         Command::Alias(a) => alias::alias(a),
         Command::Grade(a) => grade::grade(a),
         Command::Dk(a) => dk::dk(a),
+        Command::Nn(a) => nn::nn(a),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
