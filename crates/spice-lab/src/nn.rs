@@ -308,7 +308,12 @@ fn record(
 ) -> Data {
     let mut processor = template.clone();
     let ports = processor.nonlinear_port_count();
-    let inputs = ports + controls.len();
+    // Inputs: the drive of the ports, the controls, and the previous
+    // sample's solved port voltages. The previous solution is already an
+    // excellent start on most samples, so with it the network has only
+    // the jump between two samples to learn, not the whole map: trained
+    // without it, a guide made Newton slower (3 to 11 steps a sample).
+    let inputs = 2 * ports + controls.len();
     let mut rng = Rng(seed);
     let mut data = Data {
         inputs,
@@ -316,29 +321,62 @@ fn record(
         i: Vec::with_capacity(samples * ports),
     };
     while data.i.len() < samples * ports {
-        // A new setting of the controls, and a new thing played.
-        let mut values = Vec::with_capacity(controls.len());
-        for &c in controls {
-            let v = if rng.uniform() < 0.15 {
-                // The ends of the travel are where things break.
-                if rng.uniform() < 0.5 {
-                    0.0
-                } else {
-                    1.0
-                }
+        // A new setting of the controls, and a new thing played. Three
+        // times in ten, every control at one level together, most often
+        // near the top: drawn one by one they are almost never all up at
+        // once, and a player turns everything up (the micro trainer
+        // learnt this the hard way, see `micro::trajectory`).
+        let together = (rng.uniform() < 0.3).then(|| {
+            let r = rng.uniform();
+            if r < 0.6 {
+                rng.between(0.8, 1.0)
+            } else if r < 0.8 {
+                rng.between(0.0, 0.2)
             } else {
                 rng.uniform()
+            }
+        });
+        let mut values = Vec::with_capacity(controls.len());
+        for &c in controls {
+            let v = match together {
+                Some(level) => level,
+                // The ends of the travel are where things break.
+                None if rng.uniform() < 0.15 => f64::from(u8::from(rng.uniform() < 0.5)),
+                None => rng.uniform(),
             };
             processor.set_control(c, v);
             values.push(v);
         }
         let seconds = rng.between(0.4, 2.0);
-        let signal = excitation(pick(&mut rng), &mut rng, rate, seconds, volts);
+        // A third of the time, the hard things at full level: the random
+        // levels of the other excitations are spread over decades and
+        // rarely reach it, and a guide never shown the amp driven past
+        // cutoff cannot start Newton there.
+        let signal = if rng.uniform() < 1.0 / 3.0 {
+            let peak = volts * rng.between(0.7, 1.0);
+            if rng.uniform() < 0.5 {
+                let f = rng.log_between(1000.0, 6000.0);
+                (0..(seconds * rate) as usize)
+                    .map(|i| (peak * (std::f64::consts::TAU * f * i as f64 / rate).sin()) as f32)
+                    .collect()
+            } else {
+                let kind = if rng.uniform() < 0.5 { Kind::Burst } else { Kind::Chord };
+                let mut s = excitation(kind, &mut rng, rate, seconds, volts);
+                let top = s.iter().fold(0.0f32, |t, v| t.max(v.abs())).max(1e-9);
+                let gain = (peak / f64::from(top)) as f32;
+                s.iter_mut().for_each(|v| *v *= gain);
+                s
+            }
+        } else {
+            excitation(pick(&mut rng), &mut rng, rate, seconds, volts)
+        };
         for &x in &signal {
+            let previous: Vec<f64> = processor.port_voltages().to_vec();
             let drive: Vec<f64> = processor.port_drive(x).to_vec();
             processor.process_sample(x);
             data.x.extend(drive.iter().map(|&d| d as f32));
             data.x.extend(values.iter().map(|&v| v as f32));
+            data.x.extend(previous.iter().map(|&v| v as f32));
             data.i.extend_from_slice(processor.port_currents());
         }
         if processor.solver_stats().failures > 0 {
@@ -887,7 +925,7 @@ fn train(args: TrainArgs) -> CmdResult {
         }
         layers.push((i, o, w, b));
     }
-    let surrogate = Surrogate::new(ports, names, input_mean, input_scale, output_scale, layers)
+    let surrogate = Surrogate::new(ports, names, true, input_mean, input_scale, output_scale, layers)
         .map_err(|e| e.to_string())?;
     std::fs::write(&args.output, surrogate.to_text())
         .map_err(|e| format!("{}: {e}", args.output.display()))?;
