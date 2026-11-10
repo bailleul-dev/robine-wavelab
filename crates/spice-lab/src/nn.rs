@@ -377,7 +377,17 @@ fn record(
             data.x.extend(drive.iter().map(|&d| d as f32));
             data.x.extend(values.iter().map(|&v| v as f32));
             data.x.extend(previous.iter().map(|&v| v as f32));
-            data.i.extend_from_slice(processor.port_currents());
+            // The targets: the jumps of the port voltages over this
+            // sample. A guide that starts Newton predicts volts, where a
+            // current error would be amplified by K (tens of kilohms a
+            // row) before it became a starting voltage.
+            data.i.extend(
+                processor
+                    .port_voltages()
+                    .iter()
+                    .zip(&previous)
+                    .map(|(now, was)| now - was),
+            );
         }
         if processor.solver_stats().failures > 0 {
             // Newton gave up somewhere; do not learn from a blown state.
@@ -739,12 +749,12 @@ fn train(args: TrainArgs) -> CmdResult {
     });
     let inputs = parts[0].inputs;
     let mut x: Vec<f32> = Vec::new();
-    let mut currents: Vec<f64> = Vec::new();
+    let mut jumps: Vec<f64> = Vec::new();
     for p in &parts {
         x.extend_from_slice(&p.x);
-        currents.extend_from_slice(&p.i);
+        jumps.extend_from_slice(&p.i);
     }
-    let rows = currents.len() / ports;
+    let rows = jumps.len() / ports;
     println!(
         "recorded {rows} samples in {:.1} s ({threads} threads)",
         began.elapsed().as_secs_f64()
@@ -769,20 +779,9 @@ fn train(args: TrainArgs) -> CmdResult {
         .iter()
         .map(|&v| ((v / rows as f64).sqrt() as f32).max(1e-3))
         .collect();
-    // The scale of a current is its median: the level it sits at most of
-    // the time, from which the network is asked for the logarithm of how
-    // far above it goes.
-    let mut output_scale = vec![0.0f32; ports];
-    for (k, s) in output_scale.iter_mut().enumerate() {
-        let mut magnitudes: Vec<f64> = currents
-            .iter()
-            .skip(k)
-            .step_by(ports)
-            .map(|c| c.abs())
-            .collect();
-        magnitudes.sort_by(|a, b| a.total_cmp(b));
-        *s = (magnitudes[magnitudes.len() / 2] as f32).max(1e-18);
-    }
+    // A jump is volts and stays volts: the standardising below is folded
+    // into the last layer, so the output scale has nothing left to say.
+    let output_scale = vec![1.0f32; ports];
     let xn: Vec<f32> = x
         .chunks_exact(inputs)
         .flat_map(|row| {
@@ -793,17 +792,9 @@ fn train(args: TrainArgs) -> CmdResult {
         })
         .collect();
     drop(x);
-    // Targets: asinh(i / s), then standardised, the standardising being
-    // folded into the last layer on the way out.
-    let mut ys: Vec<f32> = currents
-        .chunks_exact(ports)
-        .flat_map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(k, &c)| (c / f64::from(output_scale[k])).asinh() as f32)
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Targets: the jumps, standardised, the standardising being folded
+    // into the last layer on the way out.
+    let mut ys: Vec<f32> = jumps.iter().map(|&j| j as f32).collect();
     let mut y_mean = vec![0.0f32; ports];
     let mut y_scale = vec![0.0f32; ports];
     for k in 0..ports {
@@ -829,7 +820,7 @@ fn train(args: TrainArgs) -> CmdResult {
             row[k] = (row[k] - y_mean[k]) / y_scale[k];
         }
     }
-    drop(currents);
+    drop(jumps);
 
     // ---- learn
     let mut sizes = vec![inputs];
@@ -925,8 +916,17 @@ fn train(args: TrainArgs) -> CmdResult {
         }
         layers.push((i, o, w, b));
     }
-    let surrogate = Surrogate::new(ports, names, true, input_mean, input_scale, output_scale, layers)
-        .map_err(|e| e.to_string())?;
+    let surrogate = Surrogate::new(
+        ports,
+        names,
+        true,
+        true,
+        input_mean,
+        input_scale,
+        output_scale,
+        layers,
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::write(&args.output, surrogate.to_text())
         .map_err(|e| format!("{}: {e}", args.output.display()))?;
     println!("{}", args.output.display());
