@@ -793,7 +793,11 @@ fn train(args: TrainArgs) -> CmdResult {
         .collect();
     drop(x);
     // Targets: the jumps, standardised, the standardising being folded
-    // into the last layer on the way out.
+    // into the last layer on the way out. Each row weighs by how far it
+    // jumps: the jumps are almost all near zero (a quiet sample) with rare
+    // large ones at the clipping corners, and an unweighted loss lets the
+    // network buy the bulk cheaply and miss the corners, which are the
+    // samples a guide exists for.
     let mut ys: Vec<f32> = jumps.iter().map(|&j| j as f32).collect();
     let mut y_mean = vec![0.0f32; ports];
     let mut y_scale = vec![0.0f32; ports];
@@ -820,6 +824,13 @@ fn train(args: TrainArgs) -> CmdResult {
             row[k] = (row[k] - y_mean[k]) / y_scale[k];
         }
     }
+    // A target's weight: 1 on a still port, up to 16 on one that jumps
+    // four standard deviations - the corners.
+    let weights: Vec<f32> = ys
+        .iter()
+        .map(|&y| (1.0 + y.abs().min(4.0)).powi(2))
+        .collect();
+    let weights: &[f32] = &weights;
     drop(jumps);
 
     // ---- learn
@@ -861,7 +872,9 @@ fn train(args: TrainArgs) -> CmdResult {
                     .chunks(chunk)
                     .map(|rows| {
                         let (net, xn, ys) = (&net, &xn, &ys);
-                        scope.spawn(move || gradient(net, xn, ys, rows, scale))
+                        scope.spawn(move || {
+                            weighted_gradient(net, xn, ys, Some(weights), rows, scale)
+                        })
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -884,7 +897,9 @@ fn train(args: TrainArgs) -> CmdResult {
                     .chunks(held_rows.len().div_ceil(threads).max(1))
                     .map(|rows| {
                         let (net, xn, ys) = (&net, &xn, &ys);
-                        scope.spawn(move || gradient(net, xn, ys, rows, 0.0))
+                        scope.spawn(move || {
+                            weighted_gradient(net, xn, ys, Some(weights), rows, 0.0)
+                        })
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
