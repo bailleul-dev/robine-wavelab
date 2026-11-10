@@ -250,12 +250,44 @@ fn hash_file(path: &Path) -> Result<String, String> {
 
 const GRADE_LINE: &str = "* grade: ";
 const WHY_LINE: &str = "* grade-why: ";
+const FACTS_LINE: &str = "* grade-facts: ";
 
 /// The netlist without the lines that carry its grade.
 fn without_grade(text: &str) -> String {
     text.split_inclusive('\n')
-        .filter(|l| !l.starts_with(GRADE_LINE) && !l.starts_with(WHY_LINE))
+        .filter(|l| {
+            !l.starts_with(GRADE_LINE) && !l.starts_with(WHY_LINE) && !l.starts_with(FACTS_LINE)
+        })
         .collect()
+}
+
+/// The numbers a grade came from, on one line a reader can check at a
+/// glance: `score=63 ngspice=-44.6 compared=13 close=0` (the score, the
+/// 48 kHz distance from ngspice, the distinct settings compared with a
+/// real device and how many of them are close), or `measured=no`.
+fn facts(entry: Option<&Entry>) -> String {
+    let Some(e) = entry else {
+        return "measured=no".into();
+    };
+    if e.evidence.solver.is_none() {
+        return "measured=no".into();
+    }
+    let mut parts = Vec::new();
+    if let Some(score) = e.score {
+        parts.push(format!("score={score:.0}"));
+    }
+    if let Some(db) = e.evidence.ngspice.as_ref().and_then(|n| n.db_48k) {
+        parts.push(format!("ngspice={db:.1}"));
+    }
+    parts.push(format!(
+        "compared={}",
+        rating::distinct_settings(&e.evidence.devices)
+    ));
+    parts.push(format!(
+        "close={}",
+        rating::distinct_close_settings(&e.evidence.devices)
+    ));
+    parts.join(" ")
 }
 
 /// The netlist with its grade written after the title line.
@@ -266,8 +298,9 @@ fn with_grade(text: &str, entry: Option<&Entry>) -> String {
     let plain = without_grade(text);
     let (title, rest) = plain.split_once('\n').unwrap_or((plain.as_str(), ""));
     format!(
-        "{title}\n{GRADE_LINE}{}\n{WHY_LINE}{why}\n{rest}",
-        grade.label()
+        "{title}\n{GRADE_LINE}{}\n{WHY_LINE}{why}\n{FACTS_LINE}{}\n{rest}",
+        grade.label(),
+        facts(entry)
     )
 }
 
@@ -683,14 +716,14 @@ mod tests {
         let once = with_grade(netlist, Some(&entry));
         assert_eq!(
             once,
-            "Fuzz Face\n* grade: unknown\n* grade-why: not measured\n* Converted by someone\nR1 a b 1\n"
+            "Fuzz Face\n* grade: unknown\n* grade-why: not measured\n* grade-facts: measured=no\n* Converted by someone\nR1 a b 1\n"
         );
         assert_eq!(with_grade(&once, Some(&entry)), once);
-        entry.grade = Grade::B;
+        entry.grade = Grade::Silver;
         entry.reason = "because".into();
         let twice = with_grade(&once, Some(&entry));
-        assert!(twice.contains("* grade: B\n* grade-why: because\n"));
-        assert_eq!(twice.matches("* grade").count(), 2);
+        assert!(twice.contains("* grade: silver\n* grade-why: because\n* grade-facts: measured=no\n"));
+        assert_eq!(twice.matches("* grade").count(), 3);
         assert_eq!(without_grade(&twice), netlist);
     }
 
@@ -732,7 +765,7 @@ mod tests {
         };
         let mut entry = Entry::rated(evidence);
         assert!(entry.consistent());
-        entry.grade = Grade::A;
+        entry.grade = Grade::Gold;
         assert!(!entry.consistent());
     }
 

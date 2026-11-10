@@ -1,5 +1,5 @@
 //! From evidence to a grade. Nothing is measured here: `grade measure` and
-//! `grade device` collect the evidence, this turns it into a letter, so that
+//! `grade device` collect the evidence, this turns it into a medal, so that
 //! the same evidence always gives the same grade and the rubric can be
 //! tested without ngspice.
 //!
@@ -11,33 +11,39 @@ use std::collections::BTreeMap;
 
 /// Version of the rubric. A stored grade made under another version is
 /// stale until it is rated again.
-pub const RUBRIC: u32 = 1;
+pub const RUBRIC: u32 = 2;
 
 /// How far a model is known to be right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Grade {
     /// Nothing has proved or disproved it.
-    #[serde(rename = "unknown")]
     Unknown,
-    F,
-    D,
-    C,
-    B,
-    A,
-    #[serde(rename = "A+")]
-    APlus,
+    /// No medal: it does not build, is not finite, or leaves Newton
+    /// unconverged.
+    Broken,
+    /// It runs, and its score is under 40.
+    Tin,
+    /// The solver is right; nothing shows the netlist is the pedal.
+    Bronze,
+    /// Close to a real device at one setting.
+    Silver,
+    /// Close to a real device at three distinct settings.
+    Gold,
+    /// Close to a real device at five distinct settings.
+    Platinum,
 }
 
 impl Grade {
     pub fn label(self) -> &'static str {
         match self {
             Grade::Unknown => "unknown",
-            Grade::F => "F",
-            Grade::D => "D",
-            Grade::C => "C",
-            Grade::B => "B",
-            Grade::A => "A",
-            Grade::APlus => "A+",
+            Grade::Broken => "broken",
+            Grade::Tin => "tin",
+            Grade::Bronze => "bronze",
+            Grade::Silver => "silver",
+            Grade::Gold => "gold",
+            Grade::Platinum => "platinum",
         }
     }
 }
@@ -136,30 +142,39 @@ const W_NGSPICE: f64 = 0.25;
 const W_CONTROLS: f64 = 0.15;
 const W_DEVICE: f64 = 0.60;
 
-/// Score at which each grade starts.
-const D_FROM: f64 = 0.0;
-const C_FROM: f64 = 40.0;
-const B_FROM: f64 = 60.0;
-const A_FROM: f64 = 80.0;
-const A_PLUS_FROM: f64 = 92.0;
+/// Score at which each medal starts.
+const TIN_FROM: f64 = 0.0;
+const BRONZE_FROM: f64 = 40.0;
+const SILVER_FROM: f64 = 60.0;
+const GOLD_FROM: f64 = 80.0;
+const PLATINUM_FROM: f64 = 92.0;
 
-/// Distinct settings compared with a real device before each grade is
-/// possible. Without any, a model is shown to be solved right, not to be
-/// the pedal.
-const SETTINGS_FOR_B: usize = 1;
-const SETTINGS_FOR_A: usize = 3;
-const SETTINGS_FOR_A_PLUS: usize = 5;
+/// Distinct settings close to a real device before each medal is possible.
+/// Without any, a model is shown to be solved right, not to be the pedal.
+const SETTINGS_FOR_SILVER: usize = 1;
+const SETTINGS_FOR_GOLD: usize = 3;
+const SETTINGS_FOR_PLATINUM: usize = 5;
 
-/// The best grade the comparisons with a real device allow.
-fn ceiling(settings: usize) -> (Grade, usize) {
-    if settings >= SETTINGS_FOR_A_PLUS {
-        (Grade::APlus, SETTINGS_FOR_A_PLUS)
-    } else if settings >= SETTINGS_FOR_A {
-        (Grade::A, SETTINGS_FOR_A_PLUS)
-    } else if settings >= SETTINGS_FOR_B {
-        (Grade::B, SETTINGS_FOR_A)
+/// Whether one comparison, on its own, is close to the real device: an
+/// error-to-signal ratio (pre-emphasised) of -10 dB or better, and a PEAQ
+/// grade of -2 or better when PEAQ was measured. Only a close setting
+/// raises the ceiling: a circuit compared at many settings, and far at
+/// each, is not shown to be the pedal.
+pub(crate) fn close(d: &Device) -> bool {
+    d.esr_preemphasis_db <= -10.0 && d.peaq_odg.is_none_or(|odg| odg >= -2.0)
+}
+
+/// The best grade the settings close to a real device allow, and what the
+/// medal above it would take (nothing above platinum).
+fn ceiling(settings: usize) -> (Grade, Option<usize>) {
+    if settings >= SETTINGS_FOR_PLATINUM {
+        (Grade::Platinum, None)
+    } else if settings >= SETTINGS_FOR_GOLD {
+        (Grade::Gold, Some(SETTINGS_FOR_PLATINUM))
+    } else if settings >= SETTINGS_FOR_SILVER {
+        (Grade::Silver, Some(SETTINGS_FOR_GOLD))
     } else {
-        (Grade::C, SETTINGS_FOR_B)
+        (Grade::Bronze, Some(SETTINGS_FOR_SILVER))
     }
 }
 
@@ -204,25 +219,36 @@ fn device_axis(devices: &[Device]) -> Option<f64> {
 }
 
 fn from_score(score: f64) -> Grade {
-    if score >= A_PLUS_FROM {
-        Grade::APlus
-    } else if score >= A_FROM {
-        Grade::A
-    } else if score >= B_FROM {
-        Grade::B
-    } else if score >= C_FROM {
-        Grade::C
+    if score >= PLATINUM_FROM {
+        Grade::Platinum
+    } else if score >= GOLD_FROM {
+        Grade::Gold
+    } else if score >= SILVER_FROM {
+        Grade::Silver
+    } else if score >= BRONZE_FROM {
+        Grade::Bronze
     } else {
-        debug_assert!(score >= D_FROM);
-        Grade::D
+        debug_assert!(score >= TIN_FROM);
+        Grade::Tin
     }
 }
 
 /// Distinct settings among the comparisons with a device.
-fn distinct_settings(devices: &[Device]) -> usize {
+pub(crate) fn distinct_settings(devices: &[Device]) -> usize {
     let mut seen: Vec<&BTreeMap<String, f64>> = Vec::new();
     for d in devices {
         if !seen.contains(&&d.setting) {
+            seen.push(&d.setting);
+        }
+    }
+    seen.len()
+}
+
+/// Distinct settings whose comparison is [`close`] to the real device.
+pub(crate) fn distinct_close_settings(devices: &[Device]) -> usize {
+    let mut seen: Vec<&BTreeMap<String, f64>> = Vec::new();
+    for d in devices {
+        if close(d) && !seen.contains(&&d.setting) {
             seen.push(&d.setting);
         }
     }
@@ -234,12 +260,12 @@ fn distinct_settings(devices: &[Device]) -> usize {
 /// * No solver evidence, or a solver that ran clean but nothing compared
 ///   with ngspice or a device: `unknown`.
 /// * A circuit that does not build, gives a sample that is not finite or
-///   leaves Newton unconverged: `F`, whatever else is known.
-/// * Otherwise the score of the axes with evidence gives the grade, and the
-///   grade is capped by what has been compared with: without a real device
-///   at most `C` (the solver is right, the pedal is not shown to be), with
-///   one setting of one at most `B`, with three at most `A`, and `A+` takes
-///   five.
+///   leaves Newton unconverged: `broken`, whatever else is known.
+/// * Otherwise the score of the axes with evidence gives the medal, and the
+///   medal is capped by what is close to a real device: without a close
+///   setting at most `bronze` (the solver is right, the pedal is not shown
+///   to be), with one at most `silver`, with three at most `gold`, and
+///   `platinum` takes five.
 pub fn rate(e: &Evidence) -> Rating {
     let Some(solver) = &e.solver else {
         return Rating {
@@ -283,15 +309,15 @@ pub fn rate(e: &Evidence) -> Rating {
     let score = 100.0 * sum / weight;
     let mut grade = from_score(score);
     let mut reason = format!("score {score:.0}");
-    let settings = distinct_settings(&e.devices);
+    let settings = distinct_close_settings(&e.devices);
     let (best, next) = ceiling(settings);
     if grade > best {
         grade = best;
         reason.push_str(&format!(", held at {}", best.label()));
     }
-    if best != Grade::APlus {
+    if let Some(next) = next {
         reason.push_str(&format!(
-            ": {settings} of {next} settings against a real device"
+            ": {settings} of {next} settings close to a real device"
         ));
     }
     Rating {
@@ -303,7 +329,7 @@ pub fn rate(e: &Evidence) -> Rating {
 
 fn fail(why: &str) -> Rating {
     Rating {
-        grade: Grade::F,
+        grade: Grade::Broken,
         score: Some(0.0),
         reason: why.into(),
     }
@@ -369,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_solver_is_f_whatever_else_is_known() {
+    fn a_broken_solver_is_broken_whatever_else_is_known() {
         let good = ngspice(-80.0, -80.0);
         for solver in [
             Solver {
@@ -392,7 +418,7 @@ mod tests {
                 ..Evidence::default()
             };
             let r = rate(&e);
-            assert_eq!(r.grade, Grade::F, "{}", r.reason);
+            assert_eq!(r.grade, Grade::Broken, "{}", r.reason);
         }
     }
 
@@ -406,14 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn ngspice_alone_gives_c_at_most() {
+    fn ngspice_alone_gives_bronze_at_most() {
         // Perfect against ngspice, nothing to say about the pedal.
         let r = rate(&with(Some(ngspice(-100.0, -100.0)), None, vec![]));
-        assert_eq!(r.grade, Grade::C);
+        assert_eq!(r.grade, Grade::Bronze);
         assert_eq!(r.score, Some(100.0));
         assert_eq!(
             r.reason,
-            "score 100, held at C: 0 of 1 settings against a real device"
+            "score 100, held at bronze: 0 of 1 settings close to a real device"
         );
     }
 
@@ -421,14 +447,14 @@ mod tests {
     fn ngspice_alone_ranks_below_the_cap() {
         // -40 dB both ways is a score of 50.
         let r = rate(&with(Some(ngspice(-40.0, -40.0)), None, vec![]));
-        assert_eq!(r.grade, Grade::C);
+        assert_eq!(r.grade, Grade::Bronze);
         assert_eq!(r.score, Some(50.0));
-        // Below a score of 40, a D.
+        // Below a score of 40, tin.
         let r = rate(&with(Some(ngspice(-30.0, -30.0)), None, vec![]));
-        assert_eq!(r.grade, Grade::D);
-        // -20 dB or worse everywhere is a D, not an F: it runs.
+        assert_eq!(r.grade, Grade::Tin);
+        // -20 dB or worse everywhere is tin, not broken: it runs.
         let r = rate(&with(Some(ngspice(-5.0, -10.0)), None, vec![]));
-        assert_eq!(r.grade, Grade::D);
+        assert_eq!(r.grade, Grade::Tin);
     }
 
     #[test]
@@ -475,11 +501,11 @@ mod tests {
         let r = rate(&with(ng, None, vec![poor]));
         // (0.25 * 1 + 0.60 * 0) / 0.85
         assert!((r.score.unwrap() - 29.41).abs() < 0.01, "{:?}", r.score);
-        assert_eq!(r.grade, Grade::D);
+        assert_eq!(r.grade, Grade::Tin);
     }
 
     #[test]
-    fn the_settings_against_a_real_device_raise_the_ceiling() {
+    fn the_settings_close_to_a_real_device_raise_the_ceiling() {
         let ng = Some(ngspice(-60.0, -60.0));
         let at = |n: usize| -> Vec<Device> {
             (0..n)
@@ -491,19 +517,44 @@ mod tests {
             assert_eq!(r.score, Some(100.0));
             r.grade
         };
-        assert_eq!(grade(0), Grade::C);
-        assert_eq!(grade(1), Grade::B);
-        assert_eq!(grade(2), Grade::B);
-        assert_eq!(grade(3), Grade::A);
-        assert_eq!(grade(4), Grade::A);
-        assert_eq!(grade(5), Grade::APlus);
+        assert_eq!(grade(0), Grade::Bronze);
+        assert_eq!(grade(1), Grade::Silver);
+        assert_eq!(grade(2), Grade::Silver);
+        assert_eq!(grade(3), Grade::Gold);
+        assert_eq!(grade(4), Grade::Gold);
+        assert_eq!(grade(5), Grade::Platinum);
+    }
+
+    #[test]
+    fn a_setting_compared_but_not_close_does_not_raise_the_ceiling() {
+        let ng = Some(ngspice(-60.0, -60.0));
+        // Many distinct settings, none close: esr fine but PEAQ past -2.
+        let far: Vec<Device> = (0..5)
+            .map(|k| device(-20.0, 0.1, Some(-2.5), k as f64 / 10.0))
+            .collect();
+        let r = rate(&with(ng.clone(), None, far));
+        assert_eq!(r.grade, Grade::Bronze, "{}", r.reason);
+        assert!(r.reason.contains("0 of 1 settings close"), "{}", r.reason);
+        // One close among them raises it to silver, no further.
+        let mut one = vec![device(-35.0, 0.0, Some(-0.5), 0.9)];
+        one.extend((0..4).map(|k| device(-20.0, 0.1, Some(-2.5), k as f64 / 10.0)));
+        let r = rate(&with(ng, None, one));
+        assert!(r.grade <= Grade::Silver, "{}", r.reason);
+    }
+
+    #[test]
+    fn close_takes_the_esr_and_the_peaq_when_there_is_one() {
+        assert!(close(&device(-10.0, 0.0, None, 0.5)));
+        assert!(!close(&device(-9.9, 0.0, None, 0.5)));
+        assert!(close(&device(-12.0, 0.0, Some(-2.0), 0.5)));
+        assert!(!close(&device(-12.0, 0.0, Some(-2.1), 0.5)));
     }
 
     #[test]
     fn the_same_setting_five_times_is_one_setting() {
         let ng = Some(ngspice(-60.0, -60.0));
         let devices = vec![device(-35.0, 0.0, Some(-0.5), 0.5); 5];
-        assert_eq!(rate(&with(ng, None, devices)).grade, Grade::B);
+        assert_eq!(rate(&with(ng, None, devices)).grade, Grade::Silver);
     }
 
     #[test]
@@ -512,7 +563,7 @@ mod tests {
         let devices: Vec<Device> = (0..5)
             .map(|k| device(-12.0, 0.8, Some(-3.0), k as f64 / 10.0))
             .collect();
-        assert!(rate(&with(ng, None, devices)).grade <= Grade::D);
+        assert!(rate(&with(ng, None, devices)).grade <= Grade::Tin);
     }
 
     #[test]
@@ -524,22 +575,22 @@ mod tests {
     }
 
     #[test]
-    fn grades_order_from_unknown_to_a_plus() {
+    fn grades_order_from_unknown_to_platinum() {
         let order = [
             Grade::Unknown,
-            Grade::F,
-            Grade::D,
-            Grade::C,
-            Grade::B,
-            Grade::A,
-            Grade::APlus,
+            Grade::Broken,
+            Grade::Tin,
+            Grade::Bronze,
+            Grade::Silver,
+            Grade::Gold,
+            Grade::Platinum,
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
     fn grades_are_written_as_their_label() {
-        for g in [Grade::Unknown, Grade::F, Grade::B, Grade::APlus] {
+        for g in [Grade::Unknown, Grade::Broken, Grade::Silver, Grade::Platinum] {
             let text = serde_json::to_string(&g).unwrap();
             assert_eq!(text, format!("\"{}\"", g.label()));
             assert_eq!(serde_json::from_str::<Grade>(&text).unwrap(), g);
@@ -548,10 +599,10 @@ mod tests {
 
     #[test]
     fn the_boundaries_belong_to_the_higher_grade() {
-        assert_eq!(from_score(39.99), Grade::D);
-        assert_eq!(from_score(40.0), Grade::C);
-        assert_eq!(from_score(60.0), Grade::B);
-        assert_eq!(from_score(80.0), Grade::A);
-        assert_eq!(from_score(92.0), Grade::APlus);
+        assert_eq!(from_score(39.99), Grade::Tin);
+        assert_eq!(from_score(40.0), Grade::Bronze);
+        assert_eq!(from_score(60.0), Grade::Silver);
+        assert_eq!(from_score(80.0), Grade::Gold);
+        assert_eq!(from_score(92.0), Grade::Platinum);
     }
 }
